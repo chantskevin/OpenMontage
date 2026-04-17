@@ -6,8 +6,6 @@ image-to-video generation through a simple REST API with async polling.
 
 from __future__ import annotations
 
-import base64
-import mimetypes
 import os
 import time
 from pathlib import Path
@@ -128,183 +126,6 @@ class ApiyiVeoVideo(BaseTool):
         # Approximate — APIYI pricing varies
         return 0.50
 
-    def execute(self, inputs: dict[str, Any]) -> ToolResult:
-        api_key = self._get_api_key()
-        if not api_key:
-            return ToolResult(
-                success=False,
-                error="APIYI_API_KEY not set. " + self.install_instructions,
-            )
-
-        start = time.time()
-        try:
-            result = self._generate(inputs, api_key)
-        except Exception as exc:
-            return ToolResult(success=False, error=f"APIYI Veo failed: {exc}")
-
-        result.duration_seconds = round(time.time() - start, 2)
-        result.cost_usd = self.estimate_cost(inputs)
-        return result
-
-    def _generate(self, inputs: dict[str, Any], api_key: str) -> ToolResult:
-        import requests
-
-        base_url = self._get_base_url()
-        prompt = inputs["prompt"]
-        model = inputs.get("model", "veo-3.1-fast")
-        auth_header = {"Authorization": api_key}  # APIYI uses raw token, no Bearer prefix
-
-        # Resolve image input for image-to-video
-        image_bytes = self._resolve_image(inputs)
-        has_image = image_bytes is not None
-
-        last_error: str | None = None
-
-        for attempt in range(1, MAX_RETRIES + 1):
-            # Step 1 — Submit
-            video_id = self._submit(
-                base_url, auth_header, prompt, model, image_bytes, requests
-            )
-
-            # Step 2 — Poll
-            status, error_msg = self._poll(base_url, auth_header, video_id, requests)
-
-            if status == "completed":
-                # Step 3 — Download
-                video_bytes = self._download(base_url, auth_header, video_id, requests)
-
-                if not video_bytes:
-                    raise RuntimeError("APIYI returned empty video content.")
-
-                output_path = Path(inputs.get("output_path", "apiyi_veo_output.mp4"))
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                output_path.write_bytes(video_bytes)
-
-                return ToolResult(
-                    success=True,
-                    data={
-                        "provider": self.provider,
-                        "model": model,
-                        "prompt": prompt,
-                        "output": str(output_path),
-                        "has_image_input": has_image,
-                        "attempts": attempt,
-                    },
-                    artifacts=[str(output_path)],
-                    model=model,
-                )
-
-            if status == "failed":
-                last_error = error_msg or "unknown error"
-                if any(p in last_error for p in RETRYABLE_PATTERNS) and attempt < MAX_RETRIES:
-                    time.sleep(RETRY_DELAY_S)
-                    continue
-                raise RuntimeError(f"APIYI Veo generation failed: {last_error}")
-
-            if status == "timeout":
-                raise RuntimeError("APIYI Veo generation timed out after 10 minutes.")
-
-        raise RuntimeError(f"APIYI Veo max retries exceeded. Last error: {last_error}")
-
-    def _submit(
-        self,
-        base_url: str,
-        auth_header: dict[str, str],
-        prompt: str,
-        model: str,
-        image_bytes: bytes | None,
-        requests: Any,
-    ) -> str:
-        """Submit a video generation request, return the video ID."""
-        if image_bytes is not None:
-            from io import BytesIO
-
-            files = {"input_reference": ("frame.jpg", BytesIO(image_bytes), "image/jpeg")}
-            data = {"prompt": prompt, "model": model}
-            resp = requests.post(
-                f"{base_url}/v1/videos",
-                headers=auth_header,
-                data=data,
-                files=files,
-                timeout=30,
-            )
-        else:
-            resp = requests.post(
-                f"{base_url}/v1/videos",
-                headers={**auth_header, "Content-Type": "application/json"},
-                json={"prompt": prompt, "model": model},
-                timeout=30,
-            )
-
-        if not resp.ok:
-            raise RuntimeError(f"Submit failed (HTTP {resp.status_code}): {resp.text[:500]}")
-
-        body = resp.json()
-        video_id = body.get("id")
-        if not video_id:
-            raise RuntimeError(f"Submit returned no video ID: {body}")
-
-        return video_id
-
-    def _poll(
-        self,
-        base_url: str,
-        auth_header: dict[str, str],
-        video_id: str,
-        requests: Any,
-    ) -> tuple[str, str | None]:
-        """Poll until completed, failed, or timeout. Returns (status, error_msg)."""
-        deadline = time.time() + POLL_TIMEOUT_S
-        headers = {**auth_header, "Content-Type": "application/json"}
-
-        while time.time() < deadline:
-            time.sleep(POLL_INTERVAL_S)
-
-            resp = requests.get(
-                f"{base_url}/v1/videos/{video_id}",
-                headers=headers,
-                timeout=15,
-            )
-
-            if resp.status_code == 429:
-                time.sleep(RATE_LIMIT_WAIT_S)
-                continue
-
-            if not resp.ok:
-                raise RuntimeError(f"Poll failed (HTTP {resp.status_code}): {resp.text[:500]}")
-
-            data = resp.json()
-            status = data.get("status", "")
-
-            if status == "completed":
-                return "completed", None
-
-            if status == "failed":
-                error = data.get("error", "unknown error")
-                if not isinstance(error, str):
-                    error = str(error)
-                return "failed", error
-
-        return "timeout", None
-
-    def _download(
-        self,
-        base_url: str,
-        auth_header: dict[str, str],
-        video_id: str,
-        requests: Any,
-    ) -> bytes:
-        """Download completed video bytes."""
-        headers = {**auth_header, "Content-Type": "application/json"}
-        resp = requests.get(
-            f"{base_url}/v1/videos/{video_id}/content",
-            headers=headers,
-            timeout=120,
-        )
-        if not resp.ok:
-            raise RuntimeError(f"Download failed (HTTP {resp.status_code}): {resp.text[:500]}")
-        return resp.content
-
     @staticmethod
     def _resolve_image(inputs: dict[str, Any]) -> bytes | None:
         """Resolve image from path or URL, return raw bytes or None."""
@@ -325,3 +146,165 @@ class ApiyiVeoVideo(BaseTool):
             return resp.content
 
         return None
+
+    def execute(self, inputs: dict[str, Any]) -> ToolResult:
+        api_key = self._get_api_key()
+        if not api_key:
+            return ToolResult(
+                success=False,
+                error="APIYI_API_KEY not set. " + self.install_instructions,
+            )
+
+        import requests
+
+        start = time.time()
+        base_url = self._get_base_url()
+        prompt = inputs["prompt"]
+        model = inputs.get("model", "veo-3.1-fast")
+        auth_header = {"Authorization": api_key}  # APIYI uses raw token, no Bearer prefix
+
+        # Resolve image input for image-to-video
+        image_bytes = self._resolve_image(inputs)
+        has_image = image_bytes is not None
+
+        last_error: str | None = None
+
+        try:
+            for attempt in range(1, MAX_RETRIES + 1):
+                # Step 1 — Submit video generation
+                if image_bytes is not None:
+                    from io import BytesIO
+
+                    files = {"input_reference": ("frame.jpg", BytesIO(image_bytes), "image/jpeg")}
+                    data = {"prompt": prompt, "model": model}
+                    submit_resp = requests.post(
+                        f"{base_url}/v1/videos",
+                        headers=auth_header,
+                        data=data,
+                        files=files,
+                        timeout=30,
+                    )
+                else:
+                    submit_resp = requests.post(
+                        f"{base_url}/v1/videos",
+                        headers={**auth_header, "Content-Type": "application/json"},
+                        json={"prompt": prompt, "model": model},
+                        timeout=30,
+                    )
+
+                if not submit_resp.ok:
+                    return ToolResult(
+                        success=False,
+                        error=f"APIYI Veo submit failed ({submit_resp.status_code}): {submit_resp.text[:500]}",
+                    )
+
+                body = submit_resp.json()
+                video_id = body.get("id")
+                if not video_id:
+                    return ToolResult(
+                        success=False,
+                        error=f"APIYI Veo submit returned no video ID: {body}",
+                    )
+
+                # Step 2 — Poll until completed or failed
+                deadline = time.time() + POLL_TIMEOUT_S
+                headers = {**auth_header, "Content-Type": "application/json"}
+                completed = False
+                failed = False
+
+                while time.time() < deadline:
+                    time.sleep(POLL_INTERVAL_S)
+
+                    poll_resp = requests.get(
+                        f"{base_url}/v1/videos/{video_id}",
+                        headers=headers,
+                        timeout=15,
+                    )
+
+                    if poll_resp.status_code == 429:
+                        time.sleep(RATE_LIMIT_WAIT_S)
+                        continue
+
+                    if not poll_resp.ok:
+                        return ToolResult(
+                            success=False,
+                            error=f"APIYI Veo poll failed ({poll_resp.status_code}): {poll_resp.text[:500]}",
+                        )
+
+                    poll_data = poll_resp.json()
+                    status = poll_data.get("status", "")
+
+                    if status == "completed":
+                        completed = True
+                        break
+
+                    if status == "failed":
+                        error = poll_data.get("error", "unknown error")
+                        if not isinstance(error, str):
+                            error = str(error)
+                        last_error = error
+
+                        if any(p in error for p in RETRYABLE_PATTERNS) and attempt < MAX_RETRIES:
+                            failed = True
+                            break
+                        return ToolResult(
+                            success=False,
+                            error=f"APIYI Veo generation failed: {error}",
+                        )
+
+                if failed:
+                    time.sleep(RETRY_DELAY_S)
+                    continue
+
+                if not completed:
+                    return ToolResult(
+                        success=False,
+                        error="APIYI Veo generation timed out after 10 minutes",
+                    )
+
+                # Step 3 — Download video bytes
+                content_resp = requests.get(
+                    f"{base_url}/v1/videos/{video_id}/content",
+                    headers=headers,
+                    timeout=120,
+                )
+                if not content_resp.ok:
+                    return ToolResult(
+                        success=False,
+                        error=f"APIYI Veo download failed ({content_resp.status_code}): {content_resp.text[:500]}",
+                    )
+
+                video_bytes = content_resp.content
+                if not video_bytes:
+                    return ToolResult(
+                        success=False,
+                        error="APIYI Veo returned empty video content",
+                    )
+
+                output_path = Path(inputs.get("output_path", "apiyi_veo_output.mp4"))
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_bytes(video_bytes)
+
+                return ToolResult(
+                    success=True,
+                    data={
+                        "provider": self.provider,
+                        "model": model,
+                        "prompt": prompt,
+                        "output": str(output_path),
+                        "has_image_input": has_image,
+                        "attempts": attempt,
+                    },
+                    artifacts=[str(output_path)],
+                    cost_usd=self.estimate_cost(inputs),
+                    duration_seconds=round(time.time() - start, 2),
+                    model=model,
+                )
+
+            return ToolResult(
+                success=False,
+                error=f"APIYI Veo max retries exceeded. Last error: {last_error}",
+            )
+
+        except Exception as e:
+            return ToolResult(success=False, error=f"APIYI Veo failed: {e}")
