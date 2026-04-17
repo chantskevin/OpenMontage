@@ -7,6 +7,7 @@ the tool file in tools/graphics/; no changes to this selector are needed.
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from tools.base_tool import BaseTool, ToolResult, ToolRuntime, ToolStability, ToolStatus, ToolTier
@@ -217,6 +218,13 @@ class ImageSelector(BaseTool):
         from lib.scoring import rank_providers
 
         preferred = inputs.get("preferred_provider", "auto")
+        # Env-var default: IMAGE_GEN_PROVIDER=apiyi pins a preferred provider
+        # across the whole session. Per-call preferred_provider still wins.
+        if preferred == "auto":
+            env_pref = os.environ.get("IMAGE_GEN_PROVIDER", "").strip()
+            if env_pref:
+                preferred = env_pref
+
         allowed = set(inputs.get("allowed_providers") or [])
         if allowed:
             candidates = [tool for tool in candidates if tool.provider in allowed]
