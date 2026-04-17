@@ -215,14 +215,41 @@ class GeminiTTS(BaseTool):
             json=payload,
             timeout=120,
         )
-        response.raise_for_status()
+
+        # Issue #3: extract API error body before raising
+        if not response.ok:
+            try:
+                err_msg = response.json().get("error", {}).get("message", response.text[:500])
+            except Exception:
+                err_msg = response.text[:500]
+            raise RuntimeError(f"Gemini API error (HTTP {response.status_code}): {err_msg}")
 
         data = response.json()
-        audio_b64 = data["candidates"][0]["content"]["parts"][0]["inlineData"]["data"]
+
+        # Issue #2: guard against missing/blocked candidates
+        candidates = data.get("candidates")
+        if not candidates:
+            error_info = data.get("error", {}).get("message", "No candidates in response")
+            raise RuntimeError(f"Gemini API returned no audio: {error_info}")
+
+        candidate = candidates[0]
+        finish_reason = candidate.get("finishReason", "")
+        if finish_reason == "SAFETY":
+            raise RuntimeError("Gemini blocked this request due to safety filters. Rephrase your text.")
+
+        try:
+            audio_b64 = candidate["content"]["parts"][0]["inlineData"]["data"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise RuntimeError(f"Unexpected Gemini response structure: {exc}") from exc
+
         pcm_bytes = base64.b64decode(audio_b64)
 
-        ext = "wav" if audio_format == "wav" else "pcm"
-        output_path = Path(inputs.get("output_path", f"gemini_tts_output.{ext}"))
+        # Issue #4: reject empty audio
+        if not pcm_bytes:
+            raise RuntimeError("Gemini returned empty audio data. The text may be too short or unsupported.")
+
+        # Issue #5: audio_format is already constrained by enum, use directly
+        output_path = Path(inputs.get("output_path", f"gemini_tts_output.{audio_format}"))
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         if audio_format == "wav":
