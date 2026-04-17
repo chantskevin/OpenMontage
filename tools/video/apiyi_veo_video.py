@@ -179,12 +179,22 @@ class ApiyiVeoVideo(BaseTool):
         "required": ["prompt"],
         "properties": {
             "prompt": {"type": "string", "description": "Video generation prompt"},
+            "operation": {
+                "type": "string",
+                "enum": ["text_to_video", "image_to_video", "first_last_frame_to_video"],
+                "default": "text_to_video",
+                "description": (
+                    "Generation mode. image_to_video requires image_url/image_path. "
+                    "first_last_frame_to_video requires first_frame_* and last_frame_*. "
+                    "Both image modes force a -fl model variant."
+                ),
+            },
             "model": {
                 "type": "string",
                 "enum": MODELS,
                 "description": (
                     "Explicit APIYI model name. If omitted, derived from aspect_ratio, "
-                    "resolution, fast, and image inputs. "
+                    "resolution, fast, and operation. "
                     "Pattern: veo-3.1[-landscape][-fast|-relaxed][-fl][-hd|-4k]"
                 ),
             },
@@ -205,22 +215,12 @@ class ApiyiVeoVideo(BaseTool):
                 "default": True,
                 "description": "Used to derive model. true → cheaper '-fast' variant (~40% cost reduction).",
             },
-            "image_path": {
-                "type": "string",
-                "description": "Local image path (first frame for -fl models).",
-            },
-            "image_url": {
-                "type": "string",
-                "description": "Image URL (first frame for -fl models).",
-            },
-            "last_frame_path": {
-                "type": "string",
-                "description": "Local image path for last frame (enables first-last-frame mode with -fl models).",
-            },
-            "last_frame_url": {
-                "type": "string",
-                "description": "Image URL for last frame (enables first-last-frame mode with -fl models).",
-            },
+            "image_url": {"type": "string", "description": "Reference image URL for image_to_video"},
+            "image_path": {"type": "string", "description": "Local reference image path for image_to_video"},
+            "first_frame_url": {"type": "string", "description": "First-frame URL for first_last_frame_to_video"},
+            "first_frame_path": {"type": "string", "description": "First-frame local path for first_last_frame_to_video"},
+            "last_frame_url": {"type": "string", "description": "Last-frame URL for first_last_frame_to_video"},
+            "last_frame_path": {"type": "string", "description": "Last-frame local path for first_last_frame_to_video"},
             "output_path": {"type": "string"},
         },
     }
@@ -245,22 +245,20 @@ class ApiyiVeoVideo(BaseTool):
         return ToolStatus.UNAVAILABLE
 
     def estimate_cost(self, inputs: dict[str, Any]) -> float:
-        model = self._resolve_model(inputs)
+        operation = inputs.get("operation", "text_to_video")
+        model = self._resolve_model(inputs, operation)
         return _model_pricing(model)
 
     @staticmethod
-    def _resolve_model(inputs: dict[str, Any]) -> str:
+    def _resolve_model(inputs: dict[str, Any], operation: str) -> str:
         """Pick the model name from explicit or derived inputs."""
-        has_image = bool(
-            inputs.get("image_path") or inputs.get("image_url")
-            or inputs.get("last_frame_path") or inputs.get("last_frame_url")
-        )
+        needs_fl = operation in ("image_to_video", "first_last_frame_to_video")
         return _derive_model(
             explicit_model=inputs.get("model"),
             aspect_ratio=inputs.get("aspect_ratio"),
             resolution=inputs.get("resolution"),
             fast=bool(inputs.get("fast", True)),
-            has_image=has_image,
+            has_image=needs_fl,
         )
 
     @staticmethod
@@ -282,16 +280,34 @@ class ApiyiVeoVideo(BaseTool):
         return None
 
     @classmethod
-    def _resolve_frames(cls, inputs: dict[str, Any]) -> list[bytes]:
-        """Resolve first and (optionally) last frame bytes for -fl models."""
-        frames: list[bytes] = []
-        first = cls._resolve_frame(inputs.get("image_path"), inputs.get("image_url"))
-        if first is not None:
-            frames.append(first)
+    def _resolve_frames(cls, inputs: dict[str, Any], operation: str) -> list[bytes]:
+        """Resolve input frames based on operation.
+
+        image_to_video                 → one frame from image_url/image_path
+        first_last_frame_to_video      → two frames from first_frame_* + last_frame_*
+                                         (image_url/image_path also accepted as first-frame alias)
+        text_to_video                  → no frames
+        """
+        if operation == "text_to_video":
+            return []
+
+        first = cls._resolve_frame(
+            inputs.get("first_frame_path") or inputs.get("image_path"),
+            inputs.get("first_frame_url") or inputs.get("image_url"),
+        )
+        if first is None:
+            raise ValueError(
+                f"{operation} requires image_url/image_path (or first_frame_url/first_frame_path)"
+            )
+
+        if operation == "image_to_video":
+            return [first]
+
+        # first_last_frame_to_video
         last = cls._resolve_frame(inputs.get("last_frame_path"), inputs.get("last_frame_url"))
-        if last is not None:
-            frames.append(last)
-        return frames
+        if last is None:
+            raise ValueError("first_last_frame_to_video requires last_frame_url or last_frame_path")
+        return [first, last]
 
     def execute(self, inputs: dict[str, Any]) -> ToolResult:
         api_key = self._get_api_key()
@@ -306,20 +322,19 @@ class ApiyiVeoVideo(BaseTool):
         start = time.time()
         base_url = self._get_base_url()
         prompt = inputs["prompt"]
+        operation = inputs.get("operation", "text_to_video")
         auth_header = {"Authorization": api_key}  # APIYI uses raw token, no Bearer prefix
 
-        # Resolve frames (first + optional last for -fl models)
+        # Resolve frames based on operation
         try:
-            frames = self._resolve_frames(inputs)
-        except FileNotFoundError as e:
+            frames = self._resolve_frames(inputs, operation)
+        except (FileNotFoundError, ValueError) as e:
             return ToolResult(success=False, error=str(e))
         except Exception as e:
             return ToolResult(success=False, error=f"Failed to resolve image input: {e}")
 
-        has_image = len(frames) > 0
-
-        # Resolve model (explicit or derived from aspect_ratio/resolution/fast/has_image)
-        model = self._resolve_model(inputs)
+        # Resolve model (explicit or derived from aspect_ratio/resolution/fast/operation)
+        model = self._resolve_model(inputs, operation)
         if model not in MODELS:
             return ToolResult(
                 success=False,
@@ -329,8 +344,8 @@ class ApiyiVeoVideo(BaseTool):
             return ToolResult(
                 success=False,
                 error=(
-                    f"Image input provided but model '{model}' is not frame-locked. "
-                    f"Use a -fl variant (e.g. 'veo-3.1-fast-fl', 'veo-3.1-landscape-fast-fl')."
+                    f"{operation} requires a frame-locked (-fl) model but '{model}' is not -fl. "
+                    f"Omit 'model' to auto-derive, or pick a -fl variant."
                 ),
             )
 
@@ -462,11 +477,11 @@ class ApiyiVeoVideo(BaseTool):
                         "provider": self.provider,
                         "model": model,
                         "prompt": prompt,
+                        "operation": operation,
                         "output": str(output_path),
                         "aspect_ratio": _model_aspect_ratio(model),
                         "resolution": _model_resolution(model),
                         "frame_count": len(frames),
-                        "has_image_input": has_image,
                         "attempts": attempt,
                     },
                     artifacts=[str(output_path)],
