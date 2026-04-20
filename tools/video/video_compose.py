@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -1786,23 +1787,59 @@ class VideoCompose(BaseTool):
                 cursor += float(scene["durationSeconds"] or 0)
             props["scenes"] = scenes
 
-        # Convert absolute file paths to file:// URIs for Remotion's
-        # Img and OffthreadVideo components. Apply to whichever prop shape
-        # the composition actually consumes.
-        def _resolve_path_to_uri(obj: dict[str, Any], field: str) -> None:
+        # Collect every local asset path referenced by the composition so we
+        # can both (a) derive a single --public-dir Remotion will serve them
+        # from and (b) rewrite absolute paths in the props to filenames
+        # relative to that public-dir.
+        #
+        # Why this dance: Remotion's <OffthreadVideo> / <Img> do NOT load
+        # `file://` URIs. The CLI stands up an internal HTTP server over
+        # `--public-dir` (default: the bundle's `public/` folder), and any
+        # non-URL string we hand the component is resolved against it.
+        # Previously we converted absolute paths to `file:///...` URIs,
+        # which Remotion reinterpreted as `http://localhost:3000/public/...`
+        # and returned 404 — renders silently failed every time.
+        local_asset_paths: list[tuple[dict[str, Any], str, Path]] = []
+
+        def _collect_local_asset(obj: dict[str, Any], field: str) -> None:
             source = obj.get(field, "")
-            if source and not source.startswith(("http://", "https://", "file://")):
-                resolved = Path(source).resolve()
-                if resolved.exists():
-                    posix = resolved.as_posix()
-                    obj[field] = (
-                        f"file:///{posix}" if not posix.startswith("/") else f"file://{posix}"
-                    )
+            if not source or not isinstance(source, str):
+                return
+            if source.startswith(("http://", "https://", "file://")):
+                return
+            resolved = Path(source)
+            if not resolved.is_absolute():
+                return  # already filename-only — will resolve under public-dir
+            resolved = resolved.resolve()
+            if resolved.exists() and resolved.is_file():
+                local_asset_paths.append((obj, field, resolved))
 
         for cut in props.get("cuts", []):
-            _resolve_path_to_uri(cut, "source")
+            _collect_local_asset(cut, "source")
         for scene in props.get("scenes", []):
-            _resolve_path_to_uri(scene, "src")
+            _collect_local_asset(scene, "src")
+
+        # Pick a public-dir that covers every asset. Commonly all assets and
+        # the output share a workspace root: /workspace/{clip.mp4,title.png}
+        # with output at /workspace/renders/final.mp4. Use os.path.commonpath
+        # across every asset path so an even deeper nesting still works.
+        public_dir: Path | None = None
+        if local_asset_paths:
+            common = os.path.commonpath([str(p) for _, _, p in local_asset_paths])
+            common_path = Path(common)
+            # commonpath may return a file path if there's only one asset; use
+            # its parent so the CLI serves a directory.
+            public_dir = common_path if common_path.is_dir() else common_path.parent
+
+            # Rewrite each collected path to its position under public-dir.
+            for obj, field, resolved in local_asset_paths:
+                try:
+                    rel = resolved.relative_to(public_dir)
+                    obj[field] = rel.as_posix()
+                except ValueError:
+                    # Shouldn't happen given commonpath, but leave the raw
+                    # string if it does rather than emitting a broken URI.
+                    obj[field] = str(resolved)
 
         # Build a custom themeConfig from the playbook's actual colors.
         # This ensures every video gets a unique visual identity derived
@@ -1839,6 +1876,13 @@ class VideoCompose(BaseTool):
             str(output_path),
             "--props", str(props_path),
         ]
+        # Serve the collected-assets root via Remotion's static server so the
+        # filename-rewritten props above resolve. Without this flag, Remotion
+        # serves its bundle's built-in `public/` folder, which doesn't
+        # contain workspace clips or images — every asset 404s and the
+        # render exits non-zero.
+        if public_dir is not None:
+            cmd.extend(["--public-dir", str(public_dir)])
 
         # Apply media profile dimensions. `profile` is documented as a string
         # name (e.g. "youtube_landscape"), but LLM-driven callers sometimes
@@ -1864,6 +1908,13 @@ class VideoCompose(BaseTool):
             # Windows npx cannot locate the CLI and returns "could not
             # determine executable to run".
             self.run_command(cmd, timeout=600, cwd=composer_dir)
+        except subprocess.CalledProcessError as e:
+            # stderr carries the real error (asset 404, missing prop, etc.).
+            # Surface it instead of letting str(e) reduce everything to the
+            # useless "returned non-zero exit status 1" line.
+            stderr_tail = (e.stderr or "").strip()[-2000:] if e.stderr else ""
+            detail = stderr_tail or str(e)
+            return ToolResult(success=False, error=f"Remotion render failed: {detail}")
         except Exception as e:
             return ToolResult(success=False, error=f"Remotion render failed: {e}")
         finally:
