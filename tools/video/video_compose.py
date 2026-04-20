@@ -1823,23 +1823,34 @@ class VideoCompose(BaseTool):
         # the output share a workspace root: /workspace/{clip.mp4,title.png}
         # with output at /workspace/renders/final.mp4. Use os.path.commonpath
         # across every asset path so an even deeper nesting still works.
+        #
+        # Assumes every collected path is within a single workspace root.
+        # commonpath raises ValueError on mixed roots (Windows C:\ vs D:\,
+        # or cross-workspace asset_manifest entries); we catch and skip
+        # --public-dir rather than crashing the render — Remotion will then
+        # serve its bundle's default public/ folder and the absent assets
+        # will 404 with a clear error message surfaced via the stderr tail.
         public_dir: Path | None = None
         if local_asset_paths:
-            common = os.path.commonpath([str(p) for _, _, p in local_asset_paths])
-            common_path = Path(common)
-            # commonpath may return a file path if there's only one asset; use
-            # its parent so the CLI serves a directory.
-            public_dir = common_path if common_path.is_dir() else common_path.parent
+            try:
+                common = os.path.commonpath([str(p) for _, _, p in local_asset_paths])
+            except ValueError:
+                common = ""
+            if common:
+                common_path = Path(common)
+                # commonpath may return a file path if there's only one asset;
+                # use its parent so the CLI serves a directory.
+                public_dir = common_path if common_path.is_dir() else common_path.parent
 
-            # Rewrite each collected path to its position under public-dir.
-            for obj, field, resolved in local_asset_paths:
-                try:
-                    rel = resolved.relative_to(public_dir)
-                    obj[field] = rel.as_posix()
-                except ValueError:
-                    # Shouldn't happen given commonpath, but leave the raw
-                    # string if it does rather than emitting a broken URI.
-                    obj[field] = str(resolved)
+                # Rewrite each collected path to its position under public-dir.
+                for obj, field, resolved in local_asset_paths:
+                    try:
+                        rel = resolved.relative_to(public_dir)
+                        obj[field] = rel.as_posix()
+                    except ValueError:
+                        # Shouldn't happen given commonpath, but leave the raw
+                        # string if it does rather than emitting a broken URI.
+                        obj[field] = str(resolved)
 
         # Build a custom themeConfig from the playbook's actual colors.
         # This ensures every video gets a unique visual identity derived
