@@ -32,6 +32,31 @@ Before authoring title cards, name plates, or SVG overlays, read **`skills/meta/
 
 ## Process
 
+### 0. Call `video_selector` / `image_selector` with `output_path` — never omit it
+
+Every generation tool writes a file to `output_path`. Omitting it used to fall back to a relative path in the media-worker process CWD, which silently clobbered every prior clip and left the workspace empty — then you'd call `complete_stage` with workspace URLs for files that don't exist, and the ep-loop integrity gate would reject the whole stage as a fabricated artifact. `output_path` is now REQUIRED at the tool level and will return a loud validation error if missing. Pass it on every call.
+
+Use this shape for each clip:
+
+```json
+{
+  "prompt": "<scene-specific cinematic description>",
+  "operation": "text_to_video",
+  "output_path": "scene-01-wide-ridge.mp4",
+  "aspect_ratio": "<copy from proposal_packet.production_plan.delivery_promise.aspect_ratio or leave unset for 16:9 default>",
+  "duration": "8"
+}
+```
+
+**Rules for `output_path`:**
+
+- Always present. Never `null`, `""`, or missing.
+- A workspace-relative filename (e.g. `"scene-01-wide-ridge.mp4"`) is the canonical choice — the pipeline executor resolves it against the per-job workspace root before writing, and `asset_manifest.assets[].path` should record the SAME string so downstream compose can round-trip it.
+- Use a unique filename per clip. Directors sometimes reuse a single path like `"output.mp4"` or `"apiyi_veo_output.mp4"` for multiple calls — each call then overwrites the previous one. The scene plan's `scene_id` is a natural disambiguator: `scene-{scene_id}-{short-slug}.mp4`.
+- Do not prepend guessed subdirectories like `assets/` or `renders/` unless the workspace already contains that directory. Flat filenames at the workspace root are the default.
+
+After each successful call, record the returned file path in `asset_manifest.assets[]` verbatim. If the tool fails or the file isn't present on disk afterwards, do NOT call `complete_stage` claiming a URL — either retry with different parameters, escalate to the user per the Decision Communication Contract, or call `complete_stage` with an `assets: []` entry that accurately reflects what actually landed. The ep-loop integrity gate HEAD-probes every `artifactBaseURL`-prefixed string in your artifact and will reject the stage if any 404; fabricating URLs to simulate success is both detected and failed loudly.
+
 ### 1. Prioritize Source Selects
 
 Start with:

@@ -310,6 +310,31 @@ class ApiyiVeoVideo(BaseTool):
         return [first, last]
 
     def execute(self, inputs: dict[str, Any]) -> ToolResult:
+        # output_path is required. Without it we used to fall back to a
+        # relative "apiyi_veo_output.mp4" in the process CWD, which silently
+        # clobbered every prior clip when the caller asked for multiple
+        # generations and made the file unreachable from any workspace-aware
+        # consumer. Fail loudly instead.
+        output_path_raw = inputs.get("output_path")
+        if not output_path_raw or not isinstance(output_path_raw, str):
+            return ToolResult(
+                success=False,
+                error=(
+                    "apiyi_veo_video: 'output_path' is required and must be a "
+                    "non-empty string. Pass an absolute path (or a path "
+                    "relative to the current workspace) where the generated "
+                    "mp4 should be written."
+                ),
+            )
+
+        # Mock mode — when APIYI_MOCK=1, skip the API call and write a bundled
+        # test clip to output_path. Lets end-to-end pipeline runs exercise the
+        # full stack (selector → provider → compose → integrity gate) without
+        # spending $0.25+ per clip. The clip is a landscape 1280x720 8-second
+        # MP4 so downstream aspect/duration assertions still hold.
+        if os.environ.get("APIYI_MOCK") == "1":
+            return self._execute_mock(inputs, output_path_raw)
+
         api_key = self._get_api_key()
         if not api_key:
             return ToolResult(
@@ -486,7 +511,9 @@ class ApiyiVeoVideo(BaseTool):
                         error="APIYI Veo returned empty video content",
                     )
 
-                output_path = Path(inputs.get("output_path", "apiyi_veo_output.mp4"))
+                # output_path is guaranteed non-empty by the top-of-execute
+                # check; no CWD fallback here — that footgun is fixed.
+                output_path = Path(output_path_raw)
                 output_path.parent.mkdir(parents=True, exist_ok=True)
                 output_path.write_bytes(video_bytes)
 
@@ -516,3 +543,83 @@ class ApiyiVeoVideo(BaseTool):
 
         except Exception as e:
             return ToolResult(success=False, error=f"APIYI Veo failed: {e}")
+
+    def _execute_mock(
+        self, inputs: dict[str, Any], output_path_raw: str
+    ) -> ToolResult:
+        """APIYI_MOCK=1 path: generate a landscape 1280x720 8-second test MP4
+        locally via ffmpeg and return a success envelope shaped like the real
+        path. Zero network traffic, zero cost. Used for end-to-end tests of
+        the pipeline's selector → compose → integrity-gate chain.
+        """
+        import shutil
+        import subprocess
+
+        start = time.time()
+        operation = inputs.get("operation", "text_to_video")
+        model = self._resolve_model(inputs, operation)
+
+        ffmpeg = shutil.which("ffmpeg")
+        if ffmpeg is None:
+            return ToolResult(
+                success=False,
+                error="APIYI_MOCK=1 requires ffmpeg on PATH to generate a test clip.",
+            )
+
+        output_path = Path(output_path_raw)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        aspect = _model_aspect_ratio(model)
+        width, height = (1280, 720) if aspect == "16:9" else (720, 1280)
+
+        # testsrc2 gives a moving color bar pattern — useful for eyeballing
+        # that the mock clip actually reached compose without being mistaken
+        # for a real shot. 8-second duration matches Veo 3.1's fixed length.
+        cmd = [
+            ffmpeg,
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            f"testsrc2=size={width}x{height}:rate=24:duration=8",
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=r=48000:cl=stereo",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-shortest",
+            str(output_path),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            return ToolResult(
+                success=False,
+                error=f"APIYI_MOCK ffmpeg failed: {result.stderr[:500]}",
+            )
+
+        return ToolResult(
+            success=True,
+            data={
+                "provider": self.provider,
+                "model": model,
+                "prompt": inputs["prompt"],
+                "operation": operation,
+                "output": str(output_path),
+                "aspect_ratio": aspect,
+                "resolution": _model_resolution(model),
+                "frame_count": 1,
+                "attempts": 1,
+                "mock": True,
+            },
+            artifacts=[str(output_path)],
+            cost_usd=0.0,
+            duration_seconds=round(time.time() - start, 2),
+            model=model,
+        )
