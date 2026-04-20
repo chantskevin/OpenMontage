@@ -1724,7 +1724,7 @@ class VideoCompose(BaseTool):
             data={
                 "operation": "remotion_render",
                 "output": str(output_path),
-                "profile": profile_name,
+                "profile": profile_input,
             },
             artifacts=[str(output_path)],
         )
