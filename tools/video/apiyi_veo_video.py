@@ -109,6 +109,13 @@ def _derive_model(
     if explicit_model:
         return explicit_model
 
+    # JSON Schema defaults are not applied to inputs at runtime, so when the
+    # caller (e.g. video_selector forwarding without aspect_ratio) omits the
+    # key we have to coalesce it here. Matches the schema default and keeps
+    # the -landscape suffix flowing through to the APIYI model name.
+    if aspect_ratio is None:
+        aspect_ratio = "16:9"
+
     parts = ["veo-3.1"]
 
     landscape = aspect_ratio in ("16:9", "landscape", "horizontal")
