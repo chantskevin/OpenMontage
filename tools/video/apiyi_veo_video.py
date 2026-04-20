@@ -201,8 +201,8 @@ class ApiyiVeoVideo(BaseTool):
             "aspect_ratio": {
                 "type": "string",
                 "enum": ["16:9", "9:16"],
-                "default": "9:16",
-                "description": "Used to derive model when 'model' not provided. 16:9 → landscape, 9:16 → portrait.",
+                "default": "16:9",
+                "description": "Used to derive model when 'model' not provided. 16:9 → landscape, 9:16 → portrait. Default matches every other video generator and the video_compose canvas default (1920x1080); overriding to 9:16 is a deliberate vertical-feed choice.",
             },
             "resolution": {
                 "type": "string",
