@@ -448,12 +448,31 @@ class ApiyiVeoVideo(BaseTool):
                         error="APIYI Veo generation timed out after 10 minutes",
                     )
 
-                # Step 3 — Download video bytes
+                # Step 3 — Download video bytes. APIYI has a race where the
+                # /v1/videos/{id} poll reports status="completed" before the
+                # /content endpoint has bytes ready; the first GET 400s with
+                # "task status is IN_PROGRESS, not completed". Retry that
+                # specific case with backoff (no re-submission — same
+                # video_id) before giving up, otherwise we burn the whole
+                # generation on a timing race.
                 content_resp = requests.get(
                     f"{base_url}/v1/videos/{video_id}/content",
                     headers=headers,
                     timeout=120,
                 )
+                _IN_PROGRESS_TEXT = "task status is IN_PROGRESS"
+                for delay in (10, 15, 25, 35, 45):
+                    if content_resp.status_code != 400:
+                        break
+                    if _IN_PROGRESS_TEXT not in (content_resp.text or ""):
+                        break
+                    time.sleep(delay)
+                    content_resp = requests.get(
+                        f"{base_url}/v1/videos/{video_id}/content",
+                        headers=headers,
+                        timeout=120,
+                    )
+
                 if not content_resp.ok:
                     return ToolResult(
                         success=False,
