@@ -787,6 +787,153 @@ class VideoCompose(BaseTool):
 
         return theme if theme else None
 
+    _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+
+    def _is_image_source(self, cut: dict, asset_manifest: Optional[dict] = None) -> bool:
+        """Decide whether a cut's source is a still image rather than a
+        video. Checks file extension first (covers every case where the
+        source is already a resolved path), then consults the asset
+        manifest's declared `type` as a fallback."""
+        source = cut.get("source", "")
+        if isinstance(source, str) and source:
+            ext = Path(source).suffix.lower()
+            if ext in self._IMAGE_EXTENSIONS:
+                return True
+        if asset_manifest:
+            src = cut.get("source", "")
+            for a in asset_manifest.get("assets", []):
+                if a.get("id") == src or a.get("path") == src:
+                    if a.get("type") == "image":
+                        return True
+                    break
+        return False
+
+    def _preprocess_image_cuts_to_mp4(
+        self,
+        cuts: list[dict],
+        *,
+        asset_manifest: Optional[dict],
+        profile: Any,
+        workspace_dir: Path,
+    ) -> tuple[list[dict], Any]:
+        """Rewrite image-source cuts to short MP4 loops generated via
+        FFmpeg. Remotion's Rust compositor panics on mixed video+image
+        cuts (`frame_cache.rs:257 Option::unwrap on None`), so the only
+        safe path is to hand it video everywhere.
+
+        Returns (rewritten_cuts, tempdir_handle). The caller MUST call
+        `tempdir_handle.cleanup()` once the render finishes — generated
+        MP4s live in that directory.
+
+        If there are no image cuts, returns the original list and None
+        so the caller skips cleanup entirely.
+        """
+        import tempfile
+
+        image_cut_indices = [
+            i for i, cut in enumerate(cuts)
+            if self._is_image_source(cut, asset_manifest)
+        ]
+        if not image_cut_indices:
+            return cuts, None
+
+        # Resolve target canvas (width/height/fps) from the profile. Fall
+        # back to 1920x1080@30 matching video_compose's default canvas so
+        # the preprocessed video matches what Remotion will render into.
+        width, height, fps = self._resolve_canvas_dims(profile)
+
+        ffmpeg = self._which_ffmpeg()
+        if ffmpeg is None:
+            # No ffmpeg → can't preprocess. Leave the cuts alone and let
+            # Remotion fail with the original panic; that's clearer than
+            # silently dropping the image scenes.
+            logging.getLogger(__name__).warning(
+                "image_cuts_preprocess: ffmpeg not on PATH; image cuts will "
+                "be handed to Remotion unchanged and likely crash the "
+                "compositor. Install ffmpeg to enable preprocessing."
+            )
+            return cuts, None
+
+        tempdir = tempfile.TemporaryDirectory(
+            prefix="remotion_image_preprocess_", dir=str(workspace_dir)
+        )
+        tempdir_path = Path(tempdir.name)
+
+        new_cuts = list(cuts)
+        for idx in image_cut_indices:
+            cut = dict(cuts[idx])
+            image_path = cut.get("source", "")
+            duration = self._cut_duration_seconds(cut)
+            if duration <= 0:
+                # Skip nonsensical durations — Remotion will reject the
+                # zero-length sequence with a clearer error than we could
+                # produce here.
+                continue
+            out_path = tempdir_path / f"image_cut_{idx:03d}.mp4"
+            vf = (
+                f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+                f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,"
+                f"setsar=1"
+            )
+            cmd = [
+                ffmpeg, "-y", "-loglevel", "error",
+                "-loop", "1", "-i", str(image_path),
+                "-t", f"{duration:.3f}",
+                "-r", str(fps),
+                "-vf", vf,
+                "-pix_fmt", "yuv420p",
+                "-c:v", "libx264",
+                "-preset", "veryfast",
+                str(out_path),
+            ]
+            try:
+                subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=120)
+            except subprocess.CalledProcessError as e:
+                logging.getLogger(__name__).warning(
+                    "image_cuts_preprocess: ffmpeg failed for cut %s (%s): %s",
+                    cut.get("id"), image_path, (e.stderr or "").strip()[-500:],
+                )
+                continue  # leave the cut pointing at the image; Remotion will surface the error
+            cut["source"] = str(out_path)
+            # source_in_seconds is meaningless for a synthetic image loop — drop it.
+            cut.pop("source_in_seconds", None)
+            new_cuts[idx] = cut
+
+        return new_cuts, tempdir
+
+    @staticmethod
+    def _cut_duration_seconds(cut: dict) -> float:
+        in_s = float(cut.get("in_seconds", 0) or 0)
+        out_s = cut.get("out_seconds")
+        if out_s is None:
+            dur = float(cut.get("duration") or cut.get("duration_s") or 0)
+            return max(dur, 0.0)
+        return max(float(out_s) - in_s, 0.0)
+
+    @staticmethod
+    def _resolve_canvas_dims(profile: Any) -> tuple[int, int, int]:
+        """Return (width, height, fps) from a profile input. Accepts
+        named profiles from media_profiles.py, explicit
+        {width, height, fps} dicts, or None (1920x1080 @ 30 default)."""
+        if isinstance(profile, dict):
+            w = int(profile.get("width") or 1920)
+            h = int(profile.get("height") or 1080)
+            fps = int(profile.get("fps") or 30)
+            return w, h, fps
+        if isinstance(profile, str) and profile:
+            try:
+                from lib.media_profiles import get_profile
+                p = get_profile(profile)
+                return p.width, p.height, p.fps
+            except (ImportError, ValueError):
+                pass
+        return 1920, 1080, 30
+
+    @staticmethod
+    def _which_ffmpeg() -> Optional[str]:
+        import shutil as _shutil
+        return _shutil.which("ffmpeg")
+
     def _needs_remotion(self, cuts: list[dict]) -> bool:
         """Determine whether Remotion should handle this composition.
 
@@ -1031,13 +1178,32 @@ class VideoCompose(BaseTool):
 
         # --- Explicit Remotion path (render_runtime == 'remotion') ---
         if self._needs_remotion(resolved_cuts):
+            # Image cuts (still .png/.jpg/etc in cuts[].source) crash the
+            # Remotion Rust compositor with
+            #   frame_cache.rs:257 called `Option::unwrap()` on a `None` value
+            # when mixed with video cuts. Preprocess each image cut into a
+            # short MP4 loop at the target fps/resolution so Remotion sees
+            # only video sources. Temp files are cleaned up after render.
+            resolved_cuts, image_preprocess_tempdir = self._preprocess_image_cuts_to_mp4(
+                resolved_cuts,
+                asset_manifest=asset_manifest,
+                profile=profile,
+                workspace_dir=output_path.parent,
+            )
             remotion_inputs: dict[str, Any] = {
                 "edit_decisions": dict(edit_decisions, cuts=resolved_cuts),
                 "output_path": str(output_path),
             }
             if profile:
                 remotion_inputs["profile"] = profile
-            render_result = self._remotion_render(remotion_inputs)
+            try:
+                render_result = self._remotion_render(remotion_inputs)
+            finally:
+                if image_preprocess_tempdir is not None:
+                    try:
+                        image_preprocess_tempdir.cleanup()
+                    except Exception:
+                        pass  # best-effort cleanup
 
             # Governance: NEVER silently fall back to FFmpeg when Remotion fails.
             # The agent must decide the fallback path, not the tool.
