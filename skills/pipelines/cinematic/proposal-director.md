@@ -93,7 +93,7 @@ python -c "from tools.tool_registry import registry; import json; registry.disco
 Record:
 - Video generation providers — **critical for cinematic**. If motion is required, these must be available.
 - Image generation providers — for support visuals and mood inserts
-- TTS providers — for narration (if applicable; many cinematic pieces are narration-free)
+- TTS providers — check availability so you know what's on offer before Step 4d locks the audio treatment. A `voice_led` brief without a configured TTS provider is a blocker, not a downgrade; surface it to the user rather than silently picking `music_only`.
 - Music generation — check availability honestly
 - Enhancement tools — color_grade, audio_enhance are high-value for cinematic
 - **Remotion render engine** — check `video_compose.get_info()["render_engines"]["remotion"]`
@@ -216,6 +216,35 @@ After presenting concepts, always say something like:
 If the user mixes, create a new hybrid concept entry in the proposal_packet with clear attribution: "Emotional arc from Concept A, visual treatment from Concept C, music direction from Concept B."
 
 Let the user select, combine, modify, or redirect entirely.
+
+### Step 4d: Audio Treatment Lock (HARD RULE)
+
+Cinematic covers three distinct audio treatments, and each drives a different script shape + different asset-stage toolchain. **The user picks. You surface the choice; they sign off. Defaulting silently is forbidden — silent defaults are what produced issue #7 (voice-led briefs landing as music-only videos).**
+
+Write `proposal_packet.production_plan.audio_treatment` before the user sees the final proposal:
+
+```json
+{
+  "mode": "voice_led" | "dialogue_led" | "music_only",
+  "rationale": "<one-line tie to research findings and user intent>"
+}
+```
+
+**Which mode fits:**
+
+| Signal in brief / research | Mode |
+|---|---|
+| Brand commercial, product hero, founder story, launch film, explainer-with-voice | `voice_led` |
+| User has source footage with usable speech; documentary/interview/testimonial treatment | `dialogue_led` |
+| Fashion film, abstract trailer, mood piece, atmospheric / sound-design-led | `music_only` |
+
+**Mode-specific commitments:**
+
+- `voice_led` → also lock `voice_selection` (provider, voice_id, rationale). Without a concrete voice pick the asset stage has to guess, and guessing picks the wrong register for brand work.
+- `dialogue_led` → confirm `source_media_review` actually contains usable speech files (`usable_for` includes `"dialogue"` or `"source_line"`). If not, fall back to `voice_led`; don't ship an empty-audio cut.
+- `music_only` → `rationale` MUST reflect an explicit user decision. Present as: "This is a music-only / sound-design-led piece — no narration or dialogue. Do you confirm?" Do NOT default to this mode silently to save on TTS cost.
+
+Log the choice in `decision_log` as `audio_treatment_selection` with `options_considered` covering all three modes and `rejected_because` on each unchosen one. A cinematic proposal without `audio_treatment` locked is a CRITICAL reviewer finding.
 
 ### Step 5: Music Plan (Mandatory for Cinematic)
 

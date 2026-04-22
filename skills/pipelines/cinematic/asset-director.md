@@ -57,6 +57,37 @@ Use this shape for each clip:
 
 After each successful call, record the returned file path in `asset_manifest.assets[]` verbatim. If the tool fails or the file isn't present on disk afterwards, do NOT call `complete_stage` claiming a URL — either retry with different parameters, escalate to the user per the Decision Communication Contract, or call `complete_stage` with an `assets: []` entry that accurately reflects what actually landed. The ep-loop integrity gate HEAD-probes every `artifactBaseURL`-prefixed string in your artifact and will reject the stage if any 404; fabricating URLs to simulate success is both detected and failed loudly.
 
+### 0c. Audio assets — dispatch on the proposal's audio_treatment (HARD RULE)
+
+Read `proposal_packet.production_plan.audio_treatment.mode`. **Dispatch on it. Never re-decide.** Each mode drives a different asset-stage toolchain:
+
+| `audio_treatment.mode` | Asset-stage action | Tools |
+|---|---|---|
+| `voice_led` | For each `script.sections[]` with non-empty `text`, call `tts_selector` with `speaker_directions` from the section + `voice_direction` from `script.metadata`. Record each returned audio file in `asset_manifest.assets[]` with `type: "narration"` and `scene_id: <section_id>`. | `tts_selector` (uses `proposal_packet.production_plan.voice_selection` for provider/voice). |
+| `dialogue_led` | Extract per-section audio from the user source via `audio_extract` / `transcriber` timecodes recorded by the script stage. Record each clip with `type: "narration"` and `scene_id: <section_id>`. | `audio_extract`, `transcriber`. |
+| `music_only` | Skip TTS entirely. Proceed to music and sfx per the Music Plan. Do NOT call `tts_selector` even if `sections[].text` is non-empty — that would contradict the locked mode. | — |
+
+Example `tts_selector` payload for a `voice_led` section:
+
+```json
+{
+  "text": "<script.sections[i].text>",
+  "speaker_directions": "<script.sections[i].speaker_directions>",
+  "voice_direction": "<script.metadata.voice_direction>",
+  "provider": "<proposal_packet.production_plan.voice_selection.provider>",
+  "voice_id": "<proposal_packet.production_plan.voice_selection.voice_id>",
+  "output_path": "narration-{section_id}.wav"
+}
+```
+
+**If `audio_treatment` is missing from proposal_packet** — don't default, escalate. The proposal stage is where the decision lives; picking a mode here silently reproduces the issue #7 failure mode.
+
+**Reviewer check:** the pairing must match.
+
+- `mode == voice_led` + zero `type: "narration"` assets in manifest → CRITICAL. The user's voice-led brief was lost at the asset stage.
+- `mode == music_only` + any `type: "narration"` asset → CRITICAL. The asset stage silently re-introduced narration the user opted out of.
+- `mode == dialogue_led` + zero `type: "narration"` assets → CRITICAL. The dialogue extraction didn't run or produced no output.
+
 ### 1. Prioritize Source Selects
 
 Start with:

@@ -169,12 +169,29 @@
         },
         "voice_selection": {
           "type": "object",
-          "description": "Selected voice/TTS provider and rationale",
+          "description": "Selected voice/TTS provider and rationale. Required when audio_treatment.mode == 'voice_led'.",
           "properties": {
             "provider": { "type": "string" },
             "voice_id": { "type": "string" },
             "rationale": { "type": "string" },
             "estimated_cost_usd": { "type": "number", "minimum": 0 }
+          },
+          "additionalProperties": false
+        },
+        "audio_treatment": {
+          "type": "object",
+          "description": "Locked at proposal stage — discriminates how the piece handles spoken audio. Script and asset directors read this to know whether to write+synthesize narration, extract source dialogue, or proceed without voice. Cinematic pipelines MUST lock a mode; defaulting silently is forbidden because each mode drives a different script shape and a different asset-stage toolchain.",
+          "required": ["mode", "rationale"],
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": ["voice_led", "dialogue_led", "music_only"],
+              "description": "voice_led = original narration written and TTS'd (brand commercials, founder stories, explainer-with-voice). dialogue_led = lines extracted from user-provided source footage (documentary, interview, source-led edit). music_only = atmospheric / mood-led / sound-design-led; no spoken audio at all (fashion films, abstract trailers)."
+            },
+            "rationale": {
+              "type": "string",
+              "description": "Why this mode was chosen — ties to research findings and user intent. Load-bearing for downstream reviewer checks: a music_only run with no rationale reads as 'the pipeline lost the narration by accident' rather than 'the user signed off on silence.'"
+            }
           },
           "additionalProperties": false
         },
