@@ -910,6 +910,91 @@ class VideoCompose(BaseTool):
             return max(dur, 0.0)
         return max(float(out_s) - in_s, 0.0)
 
+    def _probe_video_orientation(self, path: str) -> Optional[str]:
+        """ffprobe a source file and classify as 'portrait' / 'landscape'
+        / 'square'. Returns None on probe failure — the caller treats
+        unknown orientation as "don't contribute to the vote."""
+        import shutil as _shutil
+        ffprobe = _shutil.which("ffprobe")
+        if ffprobe is None:
+            return None
+        try:
+            proc = subprocess.run(
+                [
+                    ffprobe, "-v", "error",
+                    "-select_streams", "v:0",
+                    "-show_entries", "stream=width,height",
+                    "-of", "csv=p=0",
+                    str(path),
+                ],
+                capture_output=True, text=True, timeout=10, check=True,
+            )
+            w_str, h_str = proc.stdout.strip().split(",")
+            w, h = int(w_str), int(h_str)
+        except Exception:
+            return None
+        # ffprobe sometimes exits 0 with "0,0" on malformed inputs (e.g.
+        # a file with an invalid PNG signature). Treat that as
+        # unknown orientation — not "square".
+        if w <= 0 or h <= 0:
+            return None
+        if w == h:
+            return "square"
+        return "portrait" if h > w else "landscape"
+
+    def _auto_detect_canvas_profile(
+        self, resolved_cuts: list[dict]
+    ) -> Optional[str]:
+        """When the caller didn't pass a profile, infer canvas orientation
+        from the primary-layer cuts' actual source dimensions. Picks the
+        matching default profile for the dominant orientation.
+
+        The alternative (current default — hard 1920×1080 landscape)
+        silently scales portrait Veo output into a landscape canvas,
+        which is exactly issue #8: the agent requested aspect_ratio=9:16,
+        the clips came back portrait, and compose turned the final
+        render landscape anyway because no one told it otherwise.
+
+        Returns None on no clear signal (no primary-layer cuts,
+        ffprobe unavailable, or mixed orientations without a majority),
+        which preserves the historical 1920×1080 fallback — the
+        least-surprise outcome when intent isn't inferable.
+        """
+        orientations: list[str] = []
+        for cut in resolved_cuts:
+            if cut.get("layer", "primary") != "primary":
+                continue
+            src = cut.get("source", "")
+            if not src or not isinstance(src, str):
+                continue
+            if src.startswith(("http://", "https://")):
+                continue  # skip remote; probing would stall
+            o = self._probe_video_orientation(src)
+            if o:
+                orientations.append(o)
+
+        if not orientations:
+            return None
+
+        # Dominant orientation → matching default profile. Tie → fall
+        # through to None (preserve 1920×1080 fallback rather than
+        # coin-flipping).
+        counts = {
+            "portrait": orientations.count("portrait"),
+            "landscape": orientations.count("landscape"),
+            "square": orientations.count("square"),
+        }
+        dominant, dominant_count = max(counts.items(), key=lambda kv: kv[1])
+        total = sum(counts.values())
+        if dominant_count * 2 <= total:
+            return None  # no majority
+
+        return {
+            "portrait": "instagram_reels",  # 1080x1920 @ 30
+            "landscape": "generic_hd",       # 1920x1080 @ 30
+            "square": "instagram_feed",      # 1080x1080 @ 30
+        }.get(dominant)
+
     @staticmethod
     def _resolve_canvas_dims(profile: Any) -> tuple[int, int, int]:
         """Return (width, height, fps) from a profile input. Accepts
@@ -1127,6 +1212,20 @@ class VideoCompose(BaseTool):
 
         # Also accept profile as "output_profile" (skill convention) or "profile"
         profile = inputs.get("profile") or inputs.get("output_profile")
+
+        # When no profile is passed, infer canvas orientation from the
+        # primary-layer sources. This closes issue #8: the agent passes
+        # aspect_ratio=9:16 to video_selector and Veo produces portrait
+        # clips, but compose used to hard-default to 1920×1080 and scale
+        # the portrait source into a landscape canvas. Auto-detect picks
+        # the matching default profile (instagram_reels / generic_hd /
+        # instagram_feed) based on the dominant source orientation.
+        # Explicit `profile` still overrides — no behavior change for
+        # callers that already pin the canvas.
+        if not profile:
+            auto = self._auto_detect_canvas_profile(resolved_cuts)
+            if auto:
+                profile = auto
 
         # --- Runtime routing: honor render_runtime locked at proposal ---
         # Silent swaps are forbidden by governance. If the chosen runtime
