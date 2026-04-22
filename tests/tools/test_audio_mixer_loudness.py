@@ -257,6 +257,102 @@ def test_music_gain_db_in_full_mix(tmp_path, captured_cmd) -> None:
     assert "volume=-6.0dB" in fc or "volume=-6dB" in fc
 
 
+def test_full_mix_duck_branch_uses_amix_normalize_zero_everywhere(
+    tmp_path, captured_cmd
+) -> None:
+    """Duck branch has FOUR amix operations (speech submix, music
+    submix, final speech+music mix, optional SFX add). Every one
+    of them must ride with normalize=0 so the music doesn't get
+    halved at ANY of the nodes. Regression guard — the first
+    version of the #9 fix only covered the no-duck branch."""
+    speech_a = _make_fake_track(tmp_path / "narr_a.wav")
+    speech_b = _make_fake_track(tmp_path / "narr_b.wav")
+    music_a = _make_fake_track(tmp_path / "music_a.wav")
+    music_b = _make_fake_track(tmp_path / "music_b.wav")
+
+    AudioMixer().execute({
+        "operation": "full_mix",
+        "tracks": [
+            {"path": str(speech_a), "role": "speech"},
+            {"path": str(speech_b), "role": "speech"},
+            {"path": str(music_a), "role": "music"},
+            {"path": str(music_b), "role": "music"},
+        ],
+        "ducking": {"enabled": True},
+        "output_path": str(tmp_path / "out.wav"),
+    })
+
+    fc = _filter_complex(captured_cmd[0])
+    # Every amix in this filter graph must carry normalize=0.
+    amix_count = fc.count("amix=inputs=")
+    normalize_zero_count = fc.count("normalize=0")
+    assert amix_count >= 3, (
+        f"expected at least 3 amix operations in the duck branch, "
+        f"found {amix_count}. filter_complex: {fc}"
+    )
+    assert normalize_zero_count >= amix_count, (
+        f"every amix must include normalize=0, but counted "
+        f"{amix_count} amix operations and only {normalize_zero_count} "
+        f"normalize=0 occurrences. filter_complex: {fc}"
+    )
+
+
+def test_full_mix_duck_branch_adds_alimiter_before_loudnorm(
+    tmp_path, captured_cmd
+) -> None:
+    """The duck branch used to terminate in plain amix with no peak
+    limiter, then run loudnorm directly on that. Without alimiter,
+    summed peaks from normalize=0 can clip before loudnorm sees
+    them. The limiter must appear in the graph."""
+    speech = _make_fake_track(tmp_path / "narr.wav")
+    music = _make_fake_track(tmp_path / "music.wav")
+
+    AudioMixer().execute({
+        "operation": "full_mix",
+        "tracks": [
+            {"path": str(speech), "role": "speech"},
+            {"path": str(music), "role": "music"},
+        ],
+        "ducking": {"enabled": True},
+        "output_path": str(tmp_path / "out.wav"),
+    })
+
+    fc = _filter_complex(captured_cmd[0])
+    assert "alimiter" in fc, (
+        f"duck branch must include alimiter. filter_complex: {fc}"
+    )
+    # Order: alimiter must come BEFORE loudnorm (if loudnorm is present).
+    if "loudnorm" in fc:
+        assert fc.index("alimiter") < fc.index("loudnorm"), (
+            f"alimiter must precede loudnorm so peaks are bounded "
+            f"before the loudness normalization pass. fc: {fc}"
+        )
+
+
+def test_full_mix_duck_branch_with_sfx_still_limits(tmp_path, captured_cmd) -> None:
+    """Adding sfx routes through a second amix node before the limiter.
+    The limiter must still fire at the end."""
+    speech = _make_fake_track(tmp_path / "narr.wav")
+    music = _make_fake_track(tmp_path / "music.wav")
+    sfx = _make_fake_track(tmp_path / "sfx.wav")
+
+    AudioMixer().execute({
+        "operation": "full_mix",
+        "tracks": [
+            {"path": str(speech), "role": "speech"},
+            {"path": str(music), "role": "music"},
+            {"path": str(sfx), "role": "sfx"},
+        ],
+        "ducking": {"enabled": True},
+        "output_path": str(tmp_path / "out.wav"),
+    })
+
+    fc = _filter_complex(captured_cmd[0])
+    assert "alimiter" in fc
+    # Every amix still carries normalize=0.
+    assert fc.count("amix=inputs=") == fc.count("normalize=0")
+
+
 def test_mix_result_reports_music_gain_db(tmp_path, captured_cmd) -> None:
     """Result envelope should name the applied gain so the compose
     director can include it in the checkpoint for audit."""

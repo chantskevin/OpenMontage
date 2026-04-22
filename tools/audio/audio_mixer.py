@@ -523,26 +523,30 @@ class AudioMixer(BaseTool):
         duck_enabled = ducking.get("enabled", True) if isinstance(ducking, dict) else bool(ducking)
 
         if duck_enabled and speech_tracks and music_tracks:
-            # Mix speech tracks together first
+            # Mix speech tracks together first. normalize=0 so this
+            # submix doesn't divide by input count — issue #9 regressed
+            # through this exact amix before.
             speech_indices = list(range(len(speech_tracks)))
             speech_labels = "".join(f"[a{i}]" for i in speech_indices)
 
             if len(speech_tracks) > 1:
                 filter_parts.append(
-                    f"{speech_labels}amix=inputs={len(speech_tracks)}:duration=longest[speech_mix]"
+                    f"{speech_labels}amix=inputs={len(speech_tracks)}:"
+                    f"duration=longest:normalize=0[speech_mix]"
                 )
                 speech_out = "[speech_mix]"
             else:
                 speech_out = f"[a{speech_indices[0]}]"
 
-            # Mix music tracks together
+            # Mix music tracks together (same normalize=0 rationale).
             music_start = len(speech_tracks)
             music_indices = list(range(music_start, music_start + len(music_tracks)))
             music_labels = "".join(f"[a{i}]" for i in music_indices)
 
             if len(music_tracks) > 1:
                 filter_parts.append(
-                    f"{music_labels}amix=inputs={len(music_tracks)}:duration=longest[music_mix]"
+                    f"{music_labels}amix=inputs={len(music_tracks)}:"
+                    f"duration=longest:normalize=0[music_mix]"
                 )
                 music_in = "[music_mix]"
             else:
@@ -561,41 +565,38 @@ class AudioMixer(BaseTool):
                 f"[ducked_music]volume={music_vol * 3}[music_out]"
             )
 
-            # Duplicate speech for final mix (sidechain consumes it as key)
-            filter_parts.append(
-                f"{speech_out}acopy[speech_dup]" if speech_out.startswith("[a") else ""
-            )
-            # Re-mix speech path: we need speech audio in the output too
-            # Simpler approach: use amix on original speech and ducked music
-            # Reset: use a cleaner approach — amerge the speech mix and ducked music
-            # Actually, let's rebuild. The sidechain approach above uses speech as
-            # the key signal but doesn't consume it from the output chain.
-            # FFmpeg sidechaincompress: input 0 = audio to compress, input 1 = key signal
-            # So music is compressed, speech signal is the key. We need to mix them.
-            # Remove the last filter_part (the acopy that may be empty)
-            if filter_parts and filter_parts[-1] == "":
-                filter_parts.pop()
-
-            # Build speech mix for output separately
+            # Rebuild speech for output (sidechain consumed it as key).
+            # normalize=0 here too so multi-speech submix doesn't halve.
             if len(speech_tracks) > 1:
-                # speech_mix already exists, make a copy for output
-                filter_parts.append(f"{speech_labels}amix=inputs={len(speech_tracks)}:duration=longest[speech_out]")
+                filter_parts.append(
+                    f"{speech_labels}amix=inputs={len(speech_tracks)}:"
+                    f"duration=longest:normalize=0[speech_out]"
+                )
             else:
                 filter_parts.append(f"[a{speech_indices[0]}]acopy[speech_out]")
 
-            # Final mix: speech_out + music_out
-            mix_label = "[speech_out][music_out]amix=inputs=2:duration=longest[premix]"
+            # Final mix: speech_out + ducked music_out. Still normalize=0,
+            # then alimiter downstream to catch peaks.
+            mix_label = (
+                "[speech_out][music_out]amix=inputs=2:duration=longest:"
+                "normalize=0[premix_raw]"
+            )
 
             # Add SFX if present
             sfx_start = len(speech_tracks) + len(music_tracks)
             if sfx_tracks:
                 sfx_labels = "".join(f"[a{i}]" for i in range(sfx_start, sfx_start + len(sfx_tracks)))
-                filter_parts.append(mix_label.replace("[premix]", "[pressfx]"))
+                filter_parts.append(mix_label.replace("[premix_raw]", "[pressfx]"))
                 filter_parts.append(
-                    f"[pressfx]{sfx_labels}amix=inputs={1 + len(sfx_tracks)}:duration=longest[premix]"
+                    f"[pressfx]{sfx_labels}amix=inputs={1 + len(sfx_tracks)}:"
+                    f"duration=longest:normalize=0[premix_raw]"
                 )
             else:
                 filter_parts.append(mix_label)
+
+            # Unconditional alimiter after the duck-branch premix so
+            # summed peaks don't clip. Shape matches the no-duck branch.
+            filter_parts.append("[premix_raw]alimiter=limit=0.98[premix]")
 
         else:
             # No ducking: simple amix of all tracks. normalize=0 so each
