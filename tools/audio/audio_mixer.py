@@ -115,6 +115,22 @@ class AudioMixer(BaseTool):
             },
             "input_path": {"type": "string", "description": "Input for extract operation"},
             "output_path": {"type": "string"},
+            "_workspace_root": {
+                "type": "string",
+                "description": (
+                    "RESERVED / internal. Canonical absolute workspace "
+                    "directory injected by the media-worker HTTP route when "
+                    "?job_id=<uuid> is present. When provided, relative "
+                    "track paths, primary_audio/secondary_audio, "
+                    "input_path, video_path, music_path, and output_path "
+                    "are resolved against it (matching the video_compose "
+                    "contract from fix #13). Directors SHOULD NOT set this "
+                    "— pass workspace-relative paths (e.g. "
+                    "'background-music.mp3') and let the worker inject "
+                    "this field. Values that don't resolve to an existing "
+                    "directory are ignored."
+                ),
+            },
             "ducking": {
                 "type": "object",
                 "description": (
@@ -197,6 +213,8 @@ class AudioMixer(BaseTool):
         operation = inputs["operation"]
         start = time.time()
 
+        inputs = self._resolve_workspace_paths(inputs)
+
         try:
             if operation == "mix":
                 result = self._mix(inputs)
@@ -215,6 +233,68 @@ class AudioMixer(BaseTool):
 
         result.duration_seconds = round(time.time() - start, 2)
         return result
+
+    _PATH_FIELDS = (
+        "primary_audio", "secondary_audio",
+        "input_path", "output_path",
+        "video_path", "music_path",
+    )
+
+    def _resolve_workspace_paths(self, inputs: dict[str, Any]) -> dict[str, Any]:
+        """Resolve workspace-relative paths against `_workspace_root`.
+
+        Mirrors the path-resolution contract `video_compose` adopted in
+        fix #13. The asset manifest writes bare filenames such as
+        `background-music.mp3` for music assets; the edit decisions
+        dereference them via `asset_id` and the compose director hands
+        the dereferenced paths to `audio_mixer` unchanged. Without this
+        resolver, `_mix` / `_full_mix` / `_duck` / `_segmented_music`
+        hit `Path(p).exists()` on a bare filename and fail with
+        "Track not found", leaving the final mix silent. See issue #16.
+
+        Rules:
+          - Absolute paths pass through unchanged (trust the caller).
+          - Relative paths resolve against `_workspace_root` when it
+            exists and is a directory; otherwise pass through so local
+            / test callers keep working (cwd-relative behavior).
+          - `_workspace_root` is stripped from the returned dict so
+            downstream operation methods don't re-resolve. Caller's
+            dict is not mutated.
+        """
+        raw_root = inputs.get("_workspace_root")
+        if not isinstance(raw_root, str) or not raw_root:
+            return inputs
+
+        root = Path(raw_root)
+        if not root.exists() or not root.is_dir():
+            return inputs
+        root = root.resolve()
+
+        def _resolve(p: Any) -> Any:
+            if not isinstance(p, str) or not p:
+                return p
+            if Path(p).is_absolute():
+                return p
+            return str((root / p).resolve())
+
+        resolved = dict(inputs)
+        resolved.pop("_workspace_root", None)
+
+        for field in self._PATH_FIELDS:
+            if field in resolved:
+                resolved[field] = _resolve(resolved[field])
+
+        tracks = resolved.get("tracks")
+        if isinstance(tracks, list):
+            new_tracks = []
+            for t in tracks:
+                if isinstance(t, dict) and "path" in t:
+                    t = dict(t)
+                    t["path"] = _resolve(t["path"])
+                new_tracks.append(t)
+            resolved["tracks"] = new_tracks
+
+        return resolved
 
     def _mix(self, inputs: dict[str, Any]) -> ToolResult:
         """Mix multiple audio tracks into one output."""
