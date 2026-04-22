@@ -131,6 +131,19 @@ class AudioMixer(BaseTool):
                 },
             },
             "normalize": {"type": "boolean", "default": True},
+            "music_gain_db": {
+                "type": "number",
+                "default": 0,
+                "description": (
+                    "Gain applied to all music-role tracks before mixing, in dB. "
+                    "0 = unchanged. Positive values boost music; negative values "
+                    "duck it. Use for the music-only / video-audio case where "
+                    "amix's default averaging halves the music against near-silent "
+                    "Veo ambient audio — a small negative value pulls music below "
+                    "narration (-6 dB is typical), a small positive value brings "
+                    "music forward for music-led spots."
+                ),
+            },
             "video_path": {
                 "type": "string",
                 "description": (
@@ -211,6 +224,7 @@ class AudioMixer(BaseTool):
 
         output_path = Path(inputs.get("output_path", "mixed_audio.wav"))
         normalize = inputs.get("normalize", True)
+        music_gain_db = float(inputs.get("music_gain_db", 0) or 0)
 
         # Validate all inputs exist
         for t in tracks:
@@ -231,6 +245,10 @@ class AudioMixer(BaseTool):
             filters = []
             if volume != 1.0:
                 filters.append(f"volume={volume}")
+            # Role-based gain: boost/duck music tracks without forcing
+            # every caller to compute per-track volume.
+            if music_gain_db and track.get("role") in ("music", "secondary"):
+                filters.append(f"volume={music_gain_db}dB")
             if delay_ms > 0:
                 filters.append(f"adelay={delay_ms}|{delay_ms}")
             if fade_in > 0:
@@ -244,11 +262,20 @@ class AudioMixer(BaseTool):
             else:
                 filter_parts.append(f"[{i}:a]acopy[a{i}]")
 
-        # Amix all processed streams
+        # Amix with normalize=0 so each input rides at its own level
+        # rather than being divided by input count. The default
+        # (normalize=1) averages inputs and produces the "music gets
+        # halved by near-silent Veo ambient audio" bug reported in
+        # issue #9: music that was -14 LUFS coming in ends up -20+ LUFS
+        # after amix averaged it with low-level video ambient noise.
+        # With normalize=0, amix just sums — followed by alimiter to
+        # catch any peak clipping.
         mix_inputs = "".join(f"[a{i}]" for i in range(len(tracks)))
         filter_parts.append(
-            f"{mix_inputs}amix=inputs={len(tracks)}:duration=longest:dropout_transition=2[mixed]"
+            f"{mix_inputs}amix=inputs={len(tracks)}:duration=longest:"
+            f"dropout_transition=2:normalize=0[summed]"
         )
+        filter_parts.append("[summed]alimiter=limit=0.98[mixed]")
 
         if normalize:
             filter_parts.append("[mixed]loudnorm=I=-16:LRA=11:TP=-1.5[out]")
@@ -272,6 +299,7 @@ class AudioMixer(BaseTool):
                 "track_count": len(tracks),
                 "output": str(output_path),
                 "normalized": normalize,
+                "music_gain_db": music_gain_db,
             },
             artifacts=[str(output_path)],
         )
@@ -447,6 +475,7 @@ class AudioMixer(BaseTool):
         output_path.parent.mkdir(parents=True, exist_ok=True)
         normalize = inputs.get("normalize", True)
         ducking = inputs.get("ducking", {"enabled": True})
+        music_gain_db = float(inputs.get("music_gain_db", 0) or 0)
 
         speech_tracks = [t for t in tracks if t.get("role") in ("speech", "primary")]
         music_tracks = [t for t in tracks if t.get("role") in ("music", "secondary")]
@@ -475,6 +504,8 @@ class AudioMixer(BaseTool):
             filters = []
             if volume != 1.0:
                 filters.append(f"volume={volume}")
+            if music_gain_db and track.get("role") in ("music", "secondary"):
+                filters.append(f"volume={music_gain_db}dB")
             if delay_ms > 0:
                 filters.append(f"adelay={delay_ms}|{delay_ms}")
             if fade_in > 0:
@@ -567,11 +598,16 @@ class AudioMixer(BaseTool):
                 filter_parts.append(mix_label)
 
         else:
-            # No ducking: simple amix of all tracks
+            # No ducking: simple amix of all tracks. normalize=0 so each
+            # input rides at its own level (see the _mix docstring for
+            # why — same halving-against-near-silent-audio bug otherwise,
+            # issue #9). alimiter catches any peak clipping.
             all_labels = "".join(f"[a{i}]" for i in range(len(all_tracks)))
             filter_parts.append(
-                f"{all_labels}amix=inputs={len(all_tracks)}:duration=longest:dropout_transition=2[premix]"
+                f"{all_labels}amix=inputs={len(all_tracks)}:duration=longest:"
+                f"dropout_transition=2:normalize=0[summed]"
             )
+            filter_parts.append("[summed]alimiter=limit=0.98[premix]")
 
         # Normalize
         if normalize:
