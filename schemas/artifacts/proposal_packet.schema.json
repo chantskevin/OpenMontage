@@ -254,7 +254,35 @@
           "additionalProperties": false
         }
       },
-      "additionalProperties": false
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "$comment": "Fork issue #21: cinematic proposals must lock audio_treatment. BOS observed cinematic runs shipping production_plan without audio_treatment / voice_selection, which cascaded into silent final videos — asset-director had nothing to read and silently skipped TTS. The proposal-director skill names this as a HARD RULE; the schema encodes it so complete_stage can't write the checkpoint without it.",
+          "if": {
+            "properties": { "pipeline": { "const": "cinematic" } },
+            "required": ["pipeline"]
+          },
+          "then": {
+            "required": ["audio_treatment"]
+          }
+        },
+        {
+          "$comment": "Fork issue #21 continued: when audio_treatment.mode is voice_led, voice_selection must also be populated. The asset stage's TTS loop reads voice_selection to pick provider/voice_id; a voice_led proposal without voice_selection forces the asset stage to guess and reintroduces the issue #17 hallucination surface.",
+          "if": {
+            "properties": {
+              "audio_treatment": {
+                "type": "object",
+                "properties": { "mode": { "const": "voice_led" } },
+                "required": ["mode"]
+              }
+            },
+            "required": ["audio_treatment"]
+          },
+          "then": {
+            "required": ["voice_selection"]
+          }
+        }
+      ]
     },
     "cost_estimate": {
       "type": "object",

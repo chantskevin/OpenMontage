@@ -260,7 +260,23 @@ Present concepts clearly. Invite the user to:
 
 Set `approval.status: "pending"`. Pipeline does NOT proceed without approval.
 
-### Step 9: Submit
+### Step 9: Before calling `complete_stage` — Proposal Lock Pre-check (HARD RULE)
+
+**Fork issue #21:** even with Step 4d's HARD RULE prose, BOS observed cinematic proposals shipping `production_plan` with NO `audio_treatment` and NO `voice_selection` — the director either skipped Step 4d or satisfied the prose without actually writing the fields. The downstream asset-director had nothing to read, silently skipped TTS, and the final video shipped in silence. The user-visible failure was our agent telling them "voice-processing is temporarily faulty" — a lie caused by an unlocked proposal decision.
+
+Before calling `complete_stage` on the proposal stage, assert ALL of the following. If any fail, call `fail_stage` naming the missing field — do not complete_stage:
+
+1. **`production_plan.audio_treatment.mode`** is present and one of `{voice_led, dialogue_led, music_only}`. Missing or null is forbidden.
+2. **`production_plan.audio_treatment.rationale`** is present and non-empty. The reviewer uses rationale to tell "deliberate music_only sign-off" from "accidentally defaulted to music_only" — don't skip it.
+3. **If `audio_treatment.mode == "voice_led"`:** `production_plan.voice_selection` is present with `provider`, `voice_id`, and `provider_candidates` populated per Step 4d.1. A voice_led proposal without voice_selection forces the asset stage to guess and reintroduces the fork issue #17 hallucination surface.
+4. **`production_plan.render_runtime`** is one of `{remotion, hyperframes, ffmpeg}`. Already schema-required; verify explicitly anyway because a missing value here causes the compose stage to fail with a cryptic routing error.
+5. **`production_plan.renderer_family`** is present and matches the delivery_promise.
+
+**Reviewer check:** `schemas/artifacts/proposal_packet.schema.json` now encodes requirement (1) via a JSON Schema `if/then` — when `pipeline == "cinematic"`, `audio_treatment` is required. Requirement (3) is encoded the same way. Requirement (2) is enforced via `audio_treatment.required = [mode, rationale]`. `lib/checkpoint.py._validate_cross_artifact_invariants` is the redundant safety net for callers that bypass jsonschema.validate.
+
+A cinematic proposal that somehow lands `status: "completed"` without `audio_treatment` locked is a CRITICAL reviewer finding — the same severity as a voice_led run with zero narration assets (fork issue #19). Both are different symptoms of the same underlying bug: a stage director skipping a HARD RULE the downstream stages depend on.
+
+### Step 10: Submit
 
 Validate `proposal_packet` against schema and submit.
 

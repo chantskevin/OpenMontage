@@ -118,6 +118,175 @@ def _validate_artifacts_for_stage(
                 f"Artifact {artifact_name!r} failed schema validation: {exc}"
             ) from exc
 
+    _validate_cross_artifact_invariants(stage, status, artifacts)
+
+
+_NARRATION_ASSET_TYPES = frozenset({"narration"})
+
+
+def _count_narration_assets(asset_manifest: dict[str, Any]) -> int:
+    """Count narration assets in an asset_manifest.
+
+    The asset_manifest schema enum names exactly one spoken-audio
+    type: `narration`. Any TTS or dialogue-extract output for a
+    voice_led/dialogue_led run must use that type to count.
+    """
+    assets = asset_manifest.get("assets") or []
+    return sum(
+        1
+        for a in assets
+        if isinstance(a, dict) and a.get("type") in _NARRATION_ASSET_TYPES
+    )
+
+
+def _validate_cross_stage_invariants(
+    pipeline_dir: Path,
+    project_id: str,
+    stage: str,
+    status: str,
+    artifacts: dict[str, Any],
+) -> None:
+    """Enforce invariants that span multiple stage checkpoints on disk.
+
+    Within-checkpoint invariants live in
+    `_validate_cross_artifact_invariants`. This function loads prior
+    stage checkpoints to catch cases where a later stage's output
+    contradicts a decision locked earlier.
+
+    If a prior checkpoint can't be read, the check is skipped — we
+    don't want a missing-but-optional artifact to block a legitimate
+    checkpoint write. The skills layer names these as reviewer
+    findings too, so a skipped check isn't a silent gap.
+    """
+    if status not in {"completed", "awaiting_human"}:
+        return
+
+    # Fork issue #19: when proposal locked audio_treatment.mode to a
+    # spoken-audio mode (voice_led or dialogue_led), the asset stage
+    # MUST produce narration/voice assets. BOS runs observed zero
+    # narration entries in the manifest because the asset-director
+    # skipped the TTS loop even with the proposal lock in place.
+    if stage == "assets":
+        asset_manifest = artifacts.get("asset_manifest")
+        if not isinstance(asset_manifest, dict):
+            return
+
+        prior_proposal = read_checkpoint(pipeline_dir, project_id, "proposal")
+        if prior_proposal is None:
+            return
+        proposal_packet = (
+            prior_proposal.get("artifacts", {}).get("proposal_packet")
+        )
+        if not isinstance(proposal_packet, dict):
+            return
+
+        audio_treatment = (
+            proposal_packet.get("production_plan", {}).get("audio_treatment")
+        )
+        if not isinstance(audio_treatment, dict):
+            return
+
+        mode = audio_treatment.get("mode")
+        if mode not in {"voice_led", "dialogue_led"}:
+            return
+
+        narration_count = _count_narration_assets(asset_manifest)
+        if narration_count == 0:
+            raise CheckpointValidationError(
+                f"assets stage cannot be {status!r} when "
+                f"proposal_packet locked audio_treatment.mode={mode!r} "
+                f"but asset_manifest contains zero narration/voice "
+                f"assets. For {mode}, the asset stage must iterate "
+                f"script.sections[] and call the resolved TTS "
+                f"(voice_led) or extract source dialogue "
+                f"(dialogue_led) per section — see "
+                f"skills/pipelines/cinematic/asset-director.md → "
+                f"Step 0c.1. Silent skip is fork issue #19."
+            )
+
+
+def _validate_cross_artifact_invariants(
+    stage: str,
+    status: str,
+    artifacts: dict[str, Any],
+) -> None:
+    """Enforce invariants that span multiple artifacts in the same checkpoint.
+
+    Individual artifact schemas can't express "A and B together must agree."
+    This is where those checks live. Each invariant names the fork issue it
+    closes so a reviewer tracing a regression can find the history.
+    """
+    if status not in {"completed", "awaiting_human"}:
+        return
+
+    # Fork issue #21: a cinematic proposal without audio_treatment locked
+    # cascades into a silent final video (asset-director has nothing to
+    # read → skips TTS → silent mp4 → final_review flags silence but
+    # pipeline already shipped). The schema now encodes this conditional
+    # requirement; this check is the redundant safety net for callers
+    # that bypass jsonschema validation.
+    if stage == "proposal":
+        proposal_packet = artifacts.get("proposal_packet")
+        if isinstance(proposal_packet, dict):
+            plan = proposal_packet.get("production_plan")
+            if isinstance(plan, dict) and plan.get("pipeline") == "cinematic":
+                if "audio_treatment" not in plan:
+                    raise CheckpointValidationError(
+                        f"cinematic proposal stage cannot be {status!r} "
+                        f"without production_plan.audio_treatment locked. "
+                        f"The proposal-director's HARD RULE names the "
+                        f"three modes (voice_led, dialogue_led, "
+                        f"music_only); defaulting silently is forbidden. "
+                        f"(fork issue #21)."
+                    )
+                mode = plan["audio_treatment"].get("mode") \
+                    if isinstance(plan["audio_treatment"], dict) else None
+                if mode == "voice_led" and "voice_selection" not in plan:
+                    raise CheckpointValidationError(
+                        f"cinematic proposal with audio_treatment.mode="
+                        f"'voice_led' cannot be {status!r} without "
+                        f"production_plan.voice_selection locked. The "
+                        f"asset stage's TTS loop reads voice_selection "
+                        f"for provider+voice_id; without it the asset "
+                        f"stage has to guess and reintroduces the "
+                        f"fork issue #17 hallucination surface."
+                    )
+
+    # Fork issue #20: compose stage cannot mark itself completed when its
+    # own final_review self-report says the render failed. The schemas
+    # accept both independently; only the combination is wrong.
+    if stage == "compose":
+        final_review = artifacts.get("final_review")
+        if isinstance(final_review, dict):
+            fr_status = final_review.get("status")
+            if fr_status == "fail":
+                issues = final_review.get("issues_found") or []
+                detail = f" issues: {issues}" if issues else ""
+                raise CheckpointValidationError(
+                    f"compose stage cannot be {status!r} when "
+                    f"final_review.status=={fr_status!r}. The director's "
+                    f"self-review already flagged render failure — "
+                    f"use fail_stage instead of complete_stage. "
+                    f"(fork issue #20).{detail}"
+                )
+            # "Render failed, audio not verified." in audio_spotcheck is
+            # the exact fingerprint from fork issue #20 — the director's
+            # review spotted failure but still stamped `completed`.
+            checks = final_review.get("checks") or {}
+            audio_checks = checks.get("audio_spotcheck") or {}
+            audio_issues = audio_checks.get("issues") or []
+            if any(
+                isinstance(i, str) and "Render failed" in i
+                for i in audio_issues
+            ):
+                raise CheckpointValidationError(
+                    f"compose stage cannot be {status!r} when "
+                    f"final_review.checks.audio_spotcheck.issues names "
+                    f'"Render failed…" — the director\'s own audio '
+                    f"check saw the failure but called complete_stage "
+                    f"anyway. Use fail_stage instead "
+                    f"(fork issue #20). issues: {audio_issues}"
+                )
 
 def validate_checkpoint(checkpoint: dict[str, Any]) -> None:
     """Validate checkpoint structure and canonical artifact payloads.
