@@ -305,8 +305,21 @@ class VideoCompose(BaseTool):
         )
         return info
 
+    _VALID_OPERATIONS = (
+        "compose", "render", "remotion_render",
+        "burn_subtitles", "overlay", "encode",
+    )
+
     def execute(self, inputs: dict[str, Any]) -> ToolResult:
-        operation = inputs["operation"]
+        operation = inputs.get("operation")
+        if not operation:
+            return ToolResult(
+                success=False,
+                error=(
+                    "video_compose: 'operation' is required. Pass one of: "
+                    + ", ".join(self._VALID_OPERATIONS) + "."
+                ),
+            )
         start = time.time()
 
         try:
