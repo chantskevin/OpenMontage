@@ -69,7 +69,7 @@ class ApiyiGptImage(BaseTool):
     version = "0.1.0"
     tier = ToolTier.GENERATE
     capability = "image_generation"
-    provider = "apiyi"
+    provider = "apiyi_gpt"
     stability = ToolStability.BETA
     execution_mode = ExecutionMode.SYNC
     determinism = Determinism.STOCHASTIC

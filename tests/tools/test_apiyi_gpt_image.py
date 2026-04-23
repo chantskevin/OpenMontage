@@ -33,7 +33,12 @@ from tools.graphics.apiyi_gpt_image import (
 def test_tool_metadata() -> None:
     t = ApiyiGptImage()
     assert t.name == "apiyi_gpt_image"
-    assert t.provider == "apiyi"
+    # Distinct provider key disambiguates from apiyi_flash_image (which
+    # also uses the APIYI gateway). The selector's tool_by_provider dict
+    # keeps exactly one entry per provider key, so colliding keys make
+    # IMAGE_GEN_PROVIDER=apiyi pick whichever tool was discovered first
+    # (nondeterministic). Mirrors the apiyi_seedream_image convention.
+    assert t.provider == "apiyi_gpt"
     assert t.capability == "image_generation"
     schema = t.input_schema["properties"]
     # Aspect-ratio enum matches the hint table — adding a ratio without
