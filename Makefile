@@ -1,4 +1,4 @@
-.PHONY: setup install install-dev install-gpu test test-contracts lint clean preflight demo demo-list hyperframes-doctor hyperframes-warm
+.PHONY: setup install install-dev install-gpu test test-contracts test-renders-fast test-renders-full lint clean preflight demo demo-list hyperframes-doctor hyperframes-warm
 
 # ---- One-command setup ----
 
@@ -45,6 +45,16 @@ test:
 
 test-contracts:
 	python -m pytest tests/contracts/ -v
+
+test-renders-fast:
+	@echo "==> Render-matrix smoke (5 cells, ffmpeg-only, ~2 min)"
+	@echo "    Catches the #26/#27/#28/#30 class at PR time. No Remotion."
+	python -m pytest tests/renders/ -m render_matrix_fast -v
+
+test-renders-full:
+	@echo "==> Render-matrix full (12 cells, includes Remotion, ~10 min)"
+	@echo "    Run nightly. Remotion cells skip when npx isn't available."
+	python -m pytest tests/renders/ -m render_matrix_full -v
 
 # ---- Utilities ----
 
