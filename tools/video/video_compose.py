@@ -176,7 +176,18 @@ class VideoCompose(BaseTool):
                     },
                 },
             },
-            "audio_path": {"type": "string", "description": "Mixed audio to mux into output"},
+            "audio_path": {
+                "type": "string",
+                "description": (
+                    "Pre-mixed audio file (typically from audio_mixer) to "
+                    "mux into the rendered video. Honored by both the "
+                    "ffmpeg `compose` path and the Remotion `render` / "
+                    "`remotion_render` paths — without it, Remotion-only "
+                    "output ships with whatever audio is embedded in the "
+                    "source clips (often silent testsrc / Veo). See "
+                    "fork issue #32."
+                ),
+            },
             "profile": {
                 "type": "string",
                 "description": (
@@ -1553,6 +1564,13 @@ class VideoCompose(BaseTool):
             }
             if profile:
                 remotion_inputs["profile"] = profile
+            # Thread audio_path so _remotion_render can mux pre-mixed
+            # audio (fork issue #32). Without this, callers using the
+            # high-level `render` op with audio_path get silent output
+            # because the audio_path never reaches _remotion_render.
+            audio_path_passthrough = inputs.get("audio_path")
+            if audio_path_passthrough:
+                remotion_inputs["audio_path"] = audio_path_passthrough
             try:
                 render_result = self._remotion_render(remotion_inputs)
             finally:
@@ -2045,10 +2063,53 @@ class VideoCompose(BaseTool):
                 error=f"Remotion render completed but output file missing: {output_path}",
             )
 
+        # Mux pre-mixed audio (fork issue #32). The compose path muxes
+        # audio_path natively via ffmpeg; the Remotion path didn't, so
+        # every cinematic-trailer render shipped with a silent AAC
+        # track. ffmpeg post-pass copies the Remotion video and adds
+        # the caller's premixed audio. No-op when audio_path isn't
+        # provided or doesn't exist on disk.
+        audio_muxed = False
+        audio_path = inputs.get("audio_path")
+        if audio_path:
+            audio_resolved = Path(audio_path)
+            if not audio_resolved.is_absolute():
+                audio_resolved = Path.cwd() / audio_path
+            audio_resolved = audio_resolved.resolve()
+            if audio_resolved.exists() and audio_resolved.is_file():
+                muxed = output_path.with_name(output_path.stem + "_muxed.mp4")
+                try:
+                    self.run_command(
+                        [
+                            "ffmpeg", "-y", "-loglevel", "error",
+                            "-i", str(output_path),
+                            "-i", str(audio_resolved),
+                            "-c:v", "copy",
+                            "-c:a", "aac", "-b:a", "192k",
+                            "-map", "0:v:0",
+                            "-map", "1:a:0",
+                            "-shortest",
+                            str(muxed),
+                        ],
+                        timeout=120,
+                    )
+                    if muxed.exists() and muxed.stat().st_size > 0:
+                        muxed.replace(output_path)
+                        audio_muxed = True
+                except Exception:
+                    # Mux failed — leave the Remotion-only output and
+                    # let final_review surface the silent audio.
+                    if muxed.exists():
+                        try:
+                            muxed.unlink()
+                        except OSError:
+                            pass
+
         data: dict[str, Any] = {
             "operation": "remotion_render",
             "output": str(output_path),
             "profile": profile_input,
+            "audio_muxed": audio_muxed,
         }
         actual = self._probe_output_metadata(output_path)
         if actual is not None:
