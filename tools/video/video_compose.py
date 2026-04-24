@@ -646,16 +646,24 @@ class VideoCompose(BaseTool):
             cmd.append(str(output_path))
             self.run_command(cmd)
 
+            data = {
+                "operation": "compose",
+                "cut_count": len(cuts),
+                "has_subtitles": subtitle_path is not None,
+                "has_mixed_audio": audio_path is not None,
+                "profile": profile_name,
+                "output": str(output_path),
+            }
+            # Surface ffprobe ground-truth so downstream consumers can use
+            # probe-derived values instead of fabricating render_report
+            # fields. See VideoCompose._probe_output_metadata.
+            actual = self._probe_output_metadata(output_path)
+            if actual is not None:
+                data["actual_output"] = actual
+
             return ToolResult(
                 success=True,
-                data={
-                    "operation": "compose",
-                    "cut_count": len(cuts),
-                    "has_subtitles": subtitle_path is not None,
-                    "has_mixed_audio": audio_path is not None,
-                    "profile": profile_name,
-                    "output": str(output_path),
-                },
+                data=data,
                 artifacts=[str(output_path)],
             )
         finally:
@@ -1022,6 +1030,100 @@ class VideoCompose(BaseTool):
             "landscape": "generic_hd",       # 1920x1080 @ 30
             "square": "instagram_feed",      # 1080x1080 @ 30
         }.get(dominant)
+
+    @staticmethod
+    def _probe_output_metadata(output_path: Path) -> Optional[dict]:
+        """ffprobe a rendered output to produce ground-truth metadata.
+
+        Returns a dict shaped to drop into ToolResult.data["actual_output"]
+        so downstream consumers (compose-director skill, render_report
+        writer) can use probe-derived values instead of director-
+        fabricated self-reports.
+
+        The director's pre-render plan tells you what the render WAS
+        SUPPOSED to produce. The probe tells you what it ACTUALLY
+        produced. Every false-success render bug shipped this fork
+        (#26 30s-from-10s, #27 landscape-from-portrait, #28 black
+        output, #30 compose landscape default) traced to the gap
+        between those two. Surface the probe result so the gap is
+        visible to the next layer up.
+
+        Returns None on probe failure (ffprobe missing, output unreadable,
+        malformed file). Callers should fail loud if None — a render
+        that succeeded but can't be probed is itself a red flag.
+        """
+        import shutil as _shutil
+
+        ffprobe = _shutil.which("ffprobe")
+        if ffprobe is None:
+            return None
+        if not output_path.exists():
+            return None
+
+        try:
+            proc = subprocess.run(
+                [
+                    ffprobe, "-v", "error",
+                    "-print_format", "json",
+                    "-show_format",
+                    "-show_streams",
+                    str(output_path),
+                ],
+                capture_output=True, text=True, timeout=15, check=True,
+            )
+            data = json.loads(proc.stdout)
+        except Exception:
+            return None
+
+        result: dict[str, Any] = {
+            "path": str(output_path),
+            "file_size_bytes": int(
+                (data.get("format") or {}).get("size") or 0
+            ),
+        }
+        try:
+            result["duration_seconds"] = round(
+                float((data.get("format") or {}).get("duration") or 0), 3
+            )
+        except (TypeError, ValueError):
+            result["duration_seconds"] = 0.0
+
+        video_stream = next(
+            (s for s in data.get("streams") or []
+             if s.get("codec_type") == "video"),
+            None,
+        )
+        audio_stream = next(
+            (s for s in data.get("streams") or []
+             if s.get("codec_type") == "audio"),
+            None,
+        )
+
+        if video_stream:
+            w = int(video_stream.get("width") or 0)
+            h = int(video_stream.get("height") or 0)
+            if w > 0 and h > 0:
+                result["resolution"] = f"{w}x{h}"
+                result["width"] = w
+                result["height"] = h
+            result["video_codec"] = video_stream.get("codec_name")
+            # Compute fps from r_frame_rate fraction (e.g. "30000/1001").
+            r_fps = video_stream.get("r_frame_rate") or "0/1"
+            try:
+                num, den = r_fps.split("/")
+                if int(den) > 0:
+                    result["fps"] = round(int(num) / int(den), 3)
+            except (ValueError, ZeroDivisionError):
+                pass
+        else:
+            result["video_codec"] = None
+            result["resolution"] = None
+
+        result["has_audio"] = audio_stream is not None
+        if audio_stream:
+            result["audio_codec"] = audio_stream.get("codec_name")
+
+        return result
 
     @staticmethod
     def _resolve_cut_sources(
@@ -1774,13 +1876,18 @@ class VideoCompose(BaseTool):
                 error=f"Remotion render completed but output file missing: {output_path}",
             )
 
+        data: dict[str, Any] = {
+            "operation": "remotion_render",
+            "output": str(output_path),
+            "profile": profile_input,
+        }
+        actual = self._probe_output_metadata(output_path)
+        if actual is not None:
+            data["actual_output"] = actual
+
         return ToolResult(
             success=True,
-            data={
-                "operation": "remotion_render",
-                "output": str(output_path),
-                "profile": profile_input,
-            },
+            data=data,
             artifacts=[str(output_path)],
         )
 
