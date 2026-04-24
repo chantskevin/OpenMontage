@@ -293,6 +293,75 @@ class BaseTool(ABC):
         """Run the tool. Subclasses must implement this."""
         ...
 
+    def execute_validated(self, inputs: dict[str, Any]) -> ToolResult:
+        """Validate `inputs` against `self.input_schema` then execute.
+
+        This is the boundary helper callers should use when dispatching
+        from an HTTP layer or any context where structured error
+        signaling matters more than a Python traceback.
+
+        Validation failure → ToolResult(success=False, error_code=
+        "invalid_input", error="...field-level message...") instead of
+        the bare KeyError / TypeError that the underlying execute()
+        would raise on a missing or wrong-typed field.
+
+        Tools that want stricter or different validation can override
+        this method. The default uses jsonschema against
+        `self.input_schema`.
+
+        Existing callers of `.execute()` are not affected — this is
+        additive. Migrating a caller from `.execute()` to
+        `.execute_validated()` is the opt-in for the structured-error
+        boundary.
+        """
+        validation_error = self._validate_inputs(inputs)
+        if validation_error is not None:
+            return validation_error
+        return self.execute(inputs)
+
+    def _validate_inputs(self, inputs: dict[str, Any]) -> Optional[ToolResult]:
+        """Run jsonschema.validate(inputs, self.input_schema).
+
+        Returns a failed ToolResult on validation error, None when the
+        inputs are schema-valid. Tools with no input_schema (or an
+        empty one) skip validation — there's nothing to check.
+
+        Errors are formatted with the json-pointer-style path of the
+        offending field plus the validator's own message, so callers
+        can branch on the field name without regex-matching free text.
+        """
+        if not self.input_schema:
+            return None
+        try:
+            import jsonschema
+        except ImportError:
+            # jsonschema isn't a hard dep; if it's missing, skip
+            # validation rather than fail the call.
+            return None
+
+        try:
+            jsonschema.validate(instance=inputs, schema=self.input_schema)
+        except jsonschema.ValidationError as exc:
+            field = ".".join(str(p) for p in exc.absolute_path) or "<root>"
+            return ToolResult(
+                success=False,
+                error=(
+                    f"{self.name}: invalid input at '{field}': {exc.message}"
+                ),
+            )
+        except jsonschema.SchemaError as exc:
+            # Tool's own schema is malformed — this is a tool-author
+            # bug, not a caller bug. Surface it with a distinct prefix
+            # so callers know they didn't cause it.
+            return ToolResult(
+                success=False,
+                error=(
+                    f"{self.name}: tool schema is malformed "
+                    f"(this is a tool bug, not a caller error): {exc.message}"
+                ),
+            )
+        return None
+
     def dry_run(self, inputs: dict[str, Any]) -> dict[str, Any]:
         """Preflight check without side effects. Override for paid/publishing tools."""
         return {
