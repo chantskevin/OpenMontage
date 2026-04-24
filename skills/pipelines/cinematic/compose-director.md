@@ -54,14 +54,24 @@ If Remotion is not in the available render engines, stop and report to the user 
 
 Only use letterbox, 24fps intent, or heavy grading if they help the piece. Do not apply them because the pipeline name says cinematic.
 
-### 2. Preserve Audio Dynamics
+### 2. Choose the right audio_mixer operation (HARD RULE — fork issue #33)
 
-The mix should allow:
+`audio_mixer` exposes several operations, and picking the wrong one introduces silent regressions like fork issue #33 (the `segmented_music` `pumping` bug). Match the operation to the creative intent:
 
-- quiet moments,
-- impact moments,
-- clear dialogue or narration,
-- controlled music swells.
+| Intent | Operation | Notes |
+|---|---|---|
+| **Continuous background music** under the entire piece (the modal cinematic case) | Pass the music file directly as `audio_path` to `video_compose` | Works on both ffmpeg-`compose` and remotion-`render` paths after fork issue #32. No mixer step needed for this case. |
+| Continuous narration + continuous music (ducked) | `audio_mixer operation="full_mix"` with `tracks=[{role:"speech",...},{role:"music",...}]` and `ducking.enabled=true`, then pass the result as `audio_path` to `video_compose` | The standard cinematic narration path. Music ducks under speech, no per-cut fades. |
+| Music ONLY during specific time windows (e.g. music during talking-head section, silence during showcase clip) | `audio_mixer operation="segmented_music"` with the windows you want music in | Each segment fades in/out at its boundaries. |
+| Multiple tracks summed without ducking | `audio_mixer operation="mix"` | Use `music_gain_db` if you need to bias tracks per role. |
+
+**Do NOT use `segmented_music` with one segment per scene cut for continuous background music.** That was fork issue #33: `_segmented_music` applies a fade-in + fade-out to EVERY segment, so when segments meet at scene-cut boundaries the music dips to zero at every cut. The correct pattern for "music plays through all 3 scenes" is one of:
+
+- `audio_path=<music>` to `video_compose` directly (simplest, no mixer step)
+- `segmented_music` with a SINGLE segment spanning the whole timeline `[{start:0, end:total_duration}]` (fades only at the start/end)
+- `full_mix` if you also need narration mixed alongside
+
+If the brief calls for music to start/stop selectively, multi-segment `segmented_music` is the right choice — but verify the segments you pass match the "where should music play" creative intent, not "where the visual cuts are."
 
 ### 3. Verify The Final Mood
 

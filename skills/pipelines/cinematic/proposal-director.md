@@ -236,13 +236,20 @@ Write `proposal_packet.production_plan.audio_treatment` before the user sees the
 |---|---|
 | Brand commercial, product hero, founder story, launch film, explainer-with-voice | `voice_led` |
 | User has source footage with usable speech; documentary/interview/testimonial treatment | `dialogue_led` |
-| Fashion film, abstract trailer, mood piece, atmospheric / sound-design-led | `music_only` |
+| Fashion film, abstract trailer, mood piece, atmospheric / sound-design-led — AND brief explicitly says so | `music_only` |
+| **Brief is ambiguous (no audio cue either way)** | **`voice_led` (default)** — see fork issue #34 |
 
 **Mode-specific commitments:**
 
 - `voice_led` → also lock `voice_selection` (provider, voice_id, rationale). Without a concrete voice pick the asset stage has to guess, and guessing picks the wrong register for brand work.
 - `dialogue_led` → confirm `source_media_review` actually contains usable speech files (`usable_for` includes `"dialogue"` or `"source_line"`). If not, fall back to `voice_led`; don't ship an empty-audio cut.
-- `music_only` → `rationale` MUST reflect an explicit user decision. Present as: "This is a music-only / sound-design-led piece — no narration or dialogue. Do you confirm?" Do NOT default to this mode silently to save on TTS cost.
+- `music_only` → `rationale` MUST reflect an EXPLICIT user signal — phrases like "no narration", "atmospheric", "mood piece", "silent film", "visual-only", "sound-design-led" in the brief. Present as: "This is a music-only / sound-design-led piece — no narration or dialogue. Do you confirm?" Do NOT default to this mode silently to save on TTS cost.
+
+**HARD RULE (fork issue #34): default to `voice_led` for ambiguous briefs.** A 10s cinematic for a brand with no audio cue is most often narration-led — defaulting to `music_only` ships a silent-but-for-music deliverable that the user can't easily salvage (the asset/script/compose stages will all respect the lock). If the user wanted music_only they'll redirect; if you defaulted to music_only and they wanted narration they have to re-run the entire pipeline.
+
+Picking `music_only` requires a concrete signal from the brief. Post-hoc rationale ("the high-intensity pacing is best served by atmospheric music") is exactly the failure mode #34 calls out — narrative the director spins around an arbitrary choice. If you find yourself writing rationale like that, you're defaulting silently. Switch to `voice_led` and write narration; the user can ask for a music-only re-cut if they want.
+
+The reviewer check: a cinematic proposal with `audio_treatment.mode = "music_only"` whose `rationale` doesn't quote a brief phrase or explicit user signal is a CRITICAL finding — same severity as a missing audio_treatment lock.
 
 Log the choice in `decision_log` as `audio_treatment_selection` with `options_considered` covering all three modes and `rejected_because` on each unchosen one. A cinematic proposal without `audio_treatment` locked is a CRITICAL reviewer finding.
 
