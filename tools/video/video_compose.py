@@ -1909,7 +1909,14 @@ class VideoCompose(BaseTool):
                 return
             resolved = Path(source)
             if not resolved.is_absolute():
-                return  # already filename-only — will resolve under public-dir
+                # Bare filename or relative path — resolve against the
+                # workspace cwd. Skipping bare filenames here was the
+                # original bug (fork issue #31): callers passed sources
+                # like "scene-1.mp4" expecting them to be served from
+                # the workspace, but the collector skipped them, so
+                # public_dir stayed None and Remotion served its
+                # bundle's empty public/ → 404 for every asset.
+                resolved = Path.cwd() / source
             resolved = resolved.resolve()
             if resolved.exists() and resolved.is_file():
                 local_asset_paths.append((obj, field, resolved))
