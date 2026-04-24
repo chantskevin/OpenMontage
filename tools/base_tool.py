@@ -116,6 +116,72 @@ class RetryPolicy:
     retryable_errors: list[str] = field(default_factory=list)
 
 
+class ErrorCode(str, Enum):
+    """Closed vocabulary of failure categories.
+
+    HTTP dispatchers branch on these codes instead of regex-matching
+    error strings. Tools populate `ToolResult.error_code` to opt in;
+    legacy tools default to `legacy` and migrate over time.
+
+    Keep the vocabulary tight (~12 codes) — too narrow loses signal,
+    too wide and callers stop branching on them. When proposing a new
+    code, ask: "would an HTTP layer translate THIS code differently
+    from any of the existing codes?" If no, fold into the closest
+    existing one.
+    """
+
+    INVALID_INPUT = "invalid_input"
+    """Caller-provided inputs failed validation (schema, type, enum).
+    HTTP: 400. Caller should fix their request."""
+
+    MISSING_DEPENDENCY = "missing_dependency"
+    """Required external binary not on PATH (ffmpeg, npx, ffprobe).
+    HTTP: 503. Operator-side issue, not the caller's."""
+
+    PROVIDER_UNAVAILABLE = "provider_unavailable"
+    """API key missing, provider returned 401/403, or selector found
+    no available provider for the capability. HTTP: 503."""
+
+    PROVIDER_RATE_LIMITED = "provider_rate_limited"
+    """Provider returned 429 or equivalent. HTTP: 429. Caller may
+    retry with backoff."""
+
+    PROVIDER_TIMEOUT = "provider_timeout"
+    """Provider didn't respond within the timeout. HTTP: 504."""
+
+    PROVIDER_FAILED = "provider_failed"
+    """Generic provider failure (5xx, unexpected response shape,
+    parse error). HTTP: 502. Caller can't fix without provider
+    changes."""
+
+    ASSET_MISSING = "asset_missing"
+    """A referenced asset (file path, URL, asset_manifest ID) doesn't
+    exist or can't be reached. HTTP: 404 / 422."""
+
+    RENDER_FAILED = "render_failed"
+    """The renderer (ffmpeg, Remotion, HyperFrames) crashed or
+    returned no output. HTTP: 500."""
+
+    OUTPUT_INVALID = "output_invalid"
+    """Renderer produced output but post-condition probe found it
+    malformed (zero duration, missing video stream, all-black, etc.).
+    HTTP: 500. Often pairs with actual_output diagnostic data."""
+
+    GOVERNANCE_VIOLATION = "governance_violation"
+    """A pipeline-level invariant was broken (e.g. render_runtime
+    must be locked at proposal stage). HTTP: 422."""
+
+    INTERNAL_ERROR = "internal_error"
+    """Unhandled exception caught by an outer wrapper. HTTP: 500.
+    Includes a Python traceback in `error` for debugging."""
+
+    LEGACY = "legacy"
+    """Default for tools that haven't been migrated to populate
+    error_code. Means "I don't know what category this failure is
+    in." HTTP dispatchers should treat this as INTERNAL_ERROR for
+    routing purposes."""
+
+
 @dataclass
 class ToolResult:
     """Standard result returned by tool execution."""
@@ -123,10 +189,18 @@ class ToolResult:
     data: dict[str, Any] = field(default_factory=dict)
     artifacts: list[str] = field(default_factory=list)
     error: Optional[str] = None
+    error_code: Optional[ErrorCode] = None
     cost_usd: float = 0.0
     duration_seconds: float = 0.0
     seed: Optional[int] = None
     model: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        # Failed results without an explicit code default to LEGACY so
+        # downstream branching always has something to switch on.
+        # Successful results don't need a code (None means "no error").
+        if not self.success and self.error_code is None:
+            self.error_code = ErrorCode.LEGACY
 
 
 class BaseTool(ABC):
@@ -342,11 +416,12 @@ class BaseTool(ABC):
         try:
             jsonschema.validate(instance=inputs, schema=self.input_schema)
         except jsonschema.ValidationError as exc:
-            field = ".".join(str(p) for p in exc.absolute_path) or "<root>"
+            field_path = ".".join(str(p) for p in exc.absolute_path) or "<root>"
             return ToolResult(
                 success=False,
+                error_code=ErrorCode.INVALID_INPUT,
                 error=(
-                    f"{self.name}: invalid input at '{field}': {exc.message}"
+                    f"{self.name}: invalid input at '{field_path}': {exc.message}"
                 ),
             )
         except jsonschema.SchemaError as exc:
@@ -355,6 +430,7 @@ class BaseTool(ABC):
             # so callers know they didn't cause it.
             return ToolResult(
                 success=False,
+                error_code=ErrorCode.INTERNAL_ERROR,
                 error=(
                     f"{self.name}: tool schema is malformed "
                     f"(this is a tool bug, not a caller error): {exc.message}"
