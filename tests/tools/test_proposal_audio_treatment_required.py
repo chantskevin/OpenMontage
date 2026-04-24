@@ -67,13 +67,12 @@ def _minimal_cinematic_proposal(
             "rationale": "brand commercial voice register",
         }
     if include_voice_selection:
+        # Note: provider_candidates was added by fork issue #17, which
+        # isn't on this branch. The base voice_selection shape from #7
+        # is what the current schema accepts.
         plan["voice_selection"] = {
             "provider": "gemini",
             "voice_id": "Charon",
-            "provider_candidates": [
-                {"provider": "gemini", "voice_id": "Charon",
-                 "rationale": "warm authoritative"},
-            ],
             "rationale": "warm authoritative",
         }
     return {
