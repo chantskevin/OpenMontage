@@ -396,8 +396,40 @@ class VideoCompose(BaseTool):
         preset = inputs.get("preset", "medium")
         profile_name = inputs.get("profile")
 
-        # Resolve target resolution from profile or default
+        cuts = edit_decisions.get("cuts", [])
+        if not cuts:
+            return ToolResult(success=False, error="No cuts in edit_decisions")
+
+        # Resolve `cuts[].source` against asset_manifest IDs. The asset-
+        # and edit-director skills emit cuts that reference assets by ID,
+        # not by literal file path. Without this lookup, every skill-
+        # conformant edit_decisions fails compose with "Cut source not
+        # found". The render path got the same fix via the cuts→scenes
+        # adapter; this is the analogous fix for compose.
+        asset_manifest = inputs.get("asset_manifest") or {}
+        id_to_path: dict[str, str] = {}
+        for asset in asset_manifest.get("assets") or []:
+            aid = asset.get("id")
+            apath = asset.get("path")
+            if isinstance(aid, str) and isinstance(apath, str):
+                id_to_path[aid] = apath
+        resolved_cuts: list[dict[str, Any]] = []
+        for cut in cuts:
+            resolved = dict(cut)
+            src = cut.get("source")
+            if isinstance(src, str) and src in id_to_path:
+                resolved["source"] = id_to_path[src]
+            resolved_cuts.append(resolved)
+        cuts = resolved_cuts
+
+        # Resolve target resolution. Priority:
+        #   1. explicit profile passed by caller
+        #   2. autodetect from source-cut orientation (matches #27 fix
+        #      that landed on the render path; #30 ports it to compose)
+        #   3. fallback to 1920x1080 landscape default
         resolution = "1920x1080"
+        if not profile_name:
+            profile_name = self._auto_detect_canvas_profile(cuts)
         if profile_name:
             try:
                 from lib.media_profiles import get_profile
@@ -405,10 +437,6 @@ class VideoCompose(BaseTool):
                 resolution = f"{p.width}x{p.height}"
             except (ImportError, ValueError):
                 pass
-
-        cuts = edit_decisions.get("cuts", [])
-        if not cuts:
-            return ToolResult(success=False, error="No cuts in edit_decisions")
 
         # Resolve subtitle style using the layered priority resolver
         # (explicit > edit_decisions > playbook > defaults)
@@ -435,7 +463,20 @@ class VideoCompose(BaseTool):
             for i, cut in enumerate(cuts):
                 source = Path(cut["source"])
                 if not source.exists():
-                    return ToolResult(success=False, error=f"Cut source not found: {source}")
+                    # If the resolved source still doesn't exist, the
+                    # caller probably passed an ID that isn't in the
+                    # asset_manifest — surface both the (possibly
+                    # ID-shaped) original and the resolved path so they
+                    # can tell whether the lookup ran.
+                    return ToolResult(
+                        success=False,
+                        error=(
+                            f"Cut source not found: {source} "
+                            f"(cut[{i}].source={cut.get('source')!r}, "
+                            f"asset_manifest has "
+                            f"{len(id_to_path)} id→path entries)"
+                        ),
+                    )
 
                 seg_path = temp_dir / f"seg_{i:04d}.mp4"
                 in_s = cut["in_seconds"]
