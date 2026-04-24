@@ -58,7 +58,8 @@ def _install_render_stubs(
     dispatch receives for assertions."""
     captured: dict[str, Any] = {"ffmpeg_cmds": []}
 
-    def fake_pre(self, edit_decisions, resolved_cuts, scene_plan=None):
+    def fake_pre(self, edit_decisions, resolved_cuts, scene_plan=None,
+                 proposal_packet=None, asset_manifest=None, script=None):
         return None
 
     def fake_needs_remotion(self, cuts):
