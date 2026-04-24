@@ -400,27 +400,12 @@ class VideoCompose(BaseTool):
         if not cuts:
             return ToolResult(success=False, error="No cuts in edit_decisions")
 
-        # Resolve `cuts[].source` against asset_manifest IDs. The asset-
-        # and edit-director skills emit cuts that reference assets by ID,
-        # not by literal file path. Without this lookup, every skill-
-        # conformant edit_decisions fails compose with "Cut source not
-        # found". The render path got the same fix via the cuts→scenes
-        # adapter; this is the analogous fix for compose.
+        # Resolve cuts[].source against asset_manifest IDs via the
+        # shared helper used by both _render and _compose (see fork
+        # issue #29 — compose used to skip this and fail on every
+        # skill-conformant edit_decisions).
         asset_manifest = inputs.get("asset_manifest") or {}
-        id_to_path: dict[str, str] = {}
-        for asset in asset_manifest.get("assets") or []:
-            aid = asset.get("id")
-            apath = asset.get("path")
-            if isinstance(aid, str) and isinstance(apath, str):
-                id_to_path[aid] = apath
-        resolved_cuts: list[dict[str, Any]] = []
-        for cut in cuts:
-            resolved = dict(cut)
-            src = cut.get("source")
-            if isinstance(src, str) and src in id_to_path:
-                resolved["source"] = id_to_path[src]
-            resolved_cuts.append(resolved)
-        cuts = resolved_cuts
+        cuts = self._resolve_cut_sources(cuts, asset_manifest)
 
         # Resolve target resolution. Priority:
         #   1. explicit profile passed by caller
@@ -466,15 +451,17 @@ class VideoCompose(BaseTool):
                     # If the resolved source still doesn't exist, the
                     # caller probably passed an ID that isn't in the
                     # asset_manifest — surface both the (possibly
-                    # ID-shaped) original and the resolved path so they
+                    # ID-shaped) original and the manifest size so they
                     # can tell whether the lookup ran.
+                    manifest_size = len(
+                        (asset_manifest or {}).get("assets") or []
+                    )
                     return ToolResult(
                         success=False,
                         error=(
                             f"Cut source not found: {source} "
                             f"(cut[{i}].source={cut.get('source')!r}, "
-                            f"asset_manifest has "
-                            f"{len(id_to_path)} id→path entries)"
+                            f"asset_manifest has {manifest_size} entries)"
                         ),
                     )
 
@@ -1037,6 +1024,40 @@ class VideoCompose(BaseTool):
         }.get(dominant)
 
     @staticmethod
+    def _resolve_cut_sources(
+        cuts: list[dict],
+        asset_manifest: Optional[dict],
+    ) -> list[dict]:
+        """Replace cuts[].source asset-IDs with their asset_manifest paths.
+
+        Both _render and _compose need this resolution. Centralising it
+        prevents drift like fork issues #29 (compose path stayed on
+        literal-only treatment after render got the ID lookup) and any
+        future operation that needs the same shape.
+
+        Returns a list of NEW dicts (input cuts are not mutated). Sources
+        that don't match an ID fall through unchanged — supports the
+        backwards-compat case where the caller passes a literal path.
+        """
+        id_to_path: dict[str, str] = {}
+        for asset in (asset_manifest or {}).get("assets") or []:
+            if not isinstance(asset, dict):
+                continue
+            aid = asset.get("id")
+            apath = asset.get("path")
+            if isinstance(aid, str) and isinstance(apath, str):
+                id_to_path[aid] = apath
+
+        resolved: list[dict] = []
+        for cut in cuts:
+            new_cut = dict(cut) if isinstance(cut, dict) else {}
+            src = cut.get("source") if isinstance(cut, dict) else None
+            if isinstance(src, str) and src in id_to_path:
+                new_cut["source"] = id_to_path[src]
+            resolved.append(new_cut)
+        return resolved
+
+    @staticmethod
     def _resolve_canvas_dims(profile: Any) -> tuple[int, int, int]:
         """Return (width, height, fps) from a profile input. Accepts
         named profiles from media_profiles.py, explicit
@@ -1229,21 +1250,14 @@ class VideoCompose(BaseTool):
         output_path = Path(inputs.get("output_path", "renders/output.mp4"))
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Build asset lookup: id -> asset info
-        asset_lookup = {a["id"]: a for a in asset_manifest.get("assets", [])}
-
         cuts = edit_decisions.get("cuts", [])
         if not cuts:
             return ToolResult(success=False, error="No cuts in edit_decisions")
 
-        # Resolve asset IDs in cuts to file paths
-        resolved_cuts = []
-        for cut in cuts:
-            source_id = cut.get("source", "")
-            resolved_cut = dict(cut)
-            if source_id in asset_lookup:
-                resolved_cut["source"] = asset_lookup[source_id]["path"]
-            resolved_cuts.append(resolved_cut)
+        # Resolve asset IDs in cuts to file paths via the shared helper
+        # used by both _render and _compose (see fork issue #29 — these
+        # paths drifted apart and only render had the lookup).
+        resolved_cuts = self._resolve_cut_sources(cuts, asset_manifest)
 
         # --- Pre-compose validation gate ---
         scene_plan = inputs.get("scene_plan")
