@@ -36,19 +36,25 @@ If the approved brief or scene plan makes motion a hard requirement, verify that
 - Do not convert the piece into an animatic unless the user explicitly approves that downgrade.
 - If the render engine changes materially, tell the user before rendering and explain why.
 
-**Mandatory Remotion preflight (run before every render when the scene plan includes any Remotion scene type — title cards, stat cards, anime/hero_title, end-tag, overlays):**
+**Remotion preflight (runtime-agnostic — fork issue #35):**
 
-```bash
-python -c "
-from tools.tool_registry import registry
-registry.discover()
-info = registry.get('video_compose').get_info()
-print('Render engines:', info.get('render_engines'))
-print('Remotion note:', info.get('remotion_note'))
-"
-```
+Before calling `video_compose` with `operation="render"` or `"remotion_render"` for any scene plan that includes Remotion scene types (title cards, stat cards, anime/hero_title, end-tag, overlays), confirm Remotion is available. Use whichever introspection mechanism your runtime exposes:
+
+- **Tool-dispatch / MCP / sub-loop runtimes (no shell):** the host has already inlined `video_compose`'s `input_schema` in your prompt context — the `render_engines` and `remotion_note` fields are surfaced via `get_info()` data attached to the tool definition. Read them there. If your runtime exposes a separate introspection tool (e.g. `tools.get_info`, `/tools/{name}` HTTP route), use that.
+
+  **Do NOT call `video_compose` with empty args to "trigger preflight" — `operation` is required and the call will error.** That doom-loop pattern was fork issue #35; the LLM was reading the old shell snippet as "call video_compose" and firing `video_compose({})` repeatedly until iteration limits killed the run.
+
+- **Shell-equipped runtimes (CLI, dev workflow):** run
+
+  ```bash
+  python -c "from tools.tool_registry import registry; registry.discover(); import json; print(json.dumps(registry.get('video_compose').get_info(), indent=2))"
+  ```
+
+  and grep `render_engines` / `remotion_note` from the JSON output.
 
 If Remotion is not in the available render engines, stop and report to the user per the Decision Communication Contract. Do not substitute a reduced-fidelity render path without approval.
+
+If your runtime can't introspect at all, skip this step — the tool's own `ToolResult(success=False, error=...)` on a Remotion render with the runtime missing will surface the same information loud-fail at the actual render call. The preflight is belt-and-suspenders, not load-bearing.
 
 ### 1. Use Frame Treatment Deliberately
 
