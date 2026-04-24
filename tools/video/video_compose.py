@@ -102,8 +102,22 @@ class VideoCompose(BaseTool):
                     "recommended — when present, final_review compares "
                     "proposal_packet.production_plan.render_runtime against "
                     "edit_decisions.render_runtime and flags runtime_swap_detected. "
-                    "Without it, runtime-swap detection falls back to checking "
-                    "edit_decisions.metadata.proposal_render_runtime."
+                    "Also enables the spoken-audio narration coverage check "
+                    "(forks #22 / #23): voice_led / dialogue_led runs without "
+                    "matching narration assets get blocked here instead of "
+                    "shipping a silent video."
+                ),
+            },
+            "script": {
+                "type": "object",
+                "description": (
+                    "Full script artifact. Strongly recommended when "
+                    "audio_treatment.mode is voice_led / dialogue_led — "
+                    "enables per-section narration coverage (every non-empty "
+                    "section.id must appear as a scene_id on a narration "
+                    "asset). Without it, falls back to the weaker '≥1 "
+                    "narration asset' check, which lets partial-narration "
+                    "runs through (fork issue #23 weak form)."
                 ),
             },
             "narration_transcript_path": {
@@ -1229,6 +1243,9 @@ class VideoCompose(BaseTool):
         edit_decisions: dict[str, Any],
         resolved_cuts: list[dict],
         scene_plan: list[dict] | None = None,
+        proposal_packet: dict[str, Any] | None = None,
+        asset_manifest: dict[str, Any] | None = None,
+        script: dict[str, Any] | None = None,
     ) -> ToolResult | None:
         """Pre-compose quality gate — blocks render on critical violations.
 
@@ -1236,6 +1253,12 @@ class VideoCompose(BaseTool):
         1. Delivery promise violation: motion-required brief with >70% still cuts → BLOCK
         2. Slideshow risk score "fail" (average ≥ 4.0) → BLOCK
         3. Missing renderer_family → WARN (log only, don't block)
+        4. voice_led / dialogue_led narration coverage — when audio_treatment
+           requires spoken audio, every non-empty script.section.id must
+           appear as the scene_id of at least one type:"narration" asset.
+           `script` is REQUIRED for these modes; without it the validator
+           can't compute coverage and falls back to the weaker "≥1 narration
+           asset" check (legacy behavior, less safe).
 
         Returns a failed ToolResult if render should be blocked, None if OK to proceed.
         """
@@ -1309,6 +1332,76 @@ class VideoCompose(BaseTool):
                 "Re-run the proposal stage with a renderer_family selection."
             )
 
+        # --- 4. Spoken-audio narration coverage (fork issues #22 / #23) ---
+        # When audio_treatment is voice_led or dialogue_led, every
+        # non-empty script section must be covered by at least one
+        # narration asset. Without this guard, an asset stage that
+        # silently skips the TTS loop produces a video with valid
+        # AAC track at -91 dB ("technically successful" silent ship).
+        if proposal_packet and asset_manifest:
+            plan = proposal_packet.get("production_plan") or {}
+            audio_treatment = plan.get("audio_treatment") or {}
+            mode = audio_treatment.get("mode")
+            if mode in {"voice_led", "dialogue_led"}:
+                narration_count = sum(
+                    1
+                    for a in (asset_manifest.get("assets") or [])
+                    if isinstance(a, dict) and a.get("type") == "narration"
+                )
+
+                if isinstance(script, dict):
+                    # Strong form: per-section coverage by scene_id set.
+                    sections = script.get("sections") or []
+                    required_section_ids = [
+                        s.get("id")
+                        for s in sections
+                        if isinstance(s, dict)
+                        and isinstance(s.get("text"), str)
+                        and s["text"].strip()
+                        and isinstance(s.get("id"), str)
+                        and s["id"]
+                    ]
+                    covered_section_ids = {
+                        a.get("scene_id")
+                        for a in (asset_manifest.get("assets") or [])
+                        if isinstance(a, dict)
+                        and a.get("type") == "narration"
+                        and isinstance(a.get("scene_id"), str)
+                        and a["scene_id"]
+                    }
+                    if required_section_ids:
+                        missing = [
+                            sid
+                            for sid in required_section_ids
+                            if sid not in covered_section_ids
+                        ]
+                        if missing:
+                            issue_tag = "#22" if not covered_section_ids else "#23"
+                            blocks.append(
+                                f"audio_treatment.mode={mode!r} but "
+                                f"asset_manifest is missing narration "
+                                f"coverage for script section(s): "
+                                f"{sorted(missing)}. Required sections: "
+                                f"{sorted(required_section_ids)}. Covered "
+                                f"scene_ids on narration assets: "
+                                f"{sorted(covered_section_ids) or '[]'}. "
+                                f"Per-section coverage (by scene_id set, "
+                                f"not count) is required. (fork issue "
+                                f"{issue_tag})."
+                            )
+                elif narration_count == 0:
+                    # Weak form: script not provided, fall back to >=1.
+                    blocks.append(
+                        f"audio_treatment.mode={mode!r} but asset_manifest "
+                        f"contains zero `type: \"narration\"` assets. "
+                        f"For voice_led the asset stage must call the "
+                        f"resolved TTS per script.sections[]; for "
+                        f"dialogue_led it must extract source audio. "
+                        f"Rendering would produce a silent video. Pass "
+                        f"`script` to video_compose for per-section "
+                        f"coverage diagnostics. (fork issue #22)."
+                    )
+
         # Log warnings
         for w in warnings:
             log.warning("[pre-compose] %s", w)
@@ -1364,7 +1457,14 @@ class VideoCompose(BaseTool):
 
         # --- Pre-compose validation gate ---
         scene_plan = inputs.get("scene_plan")
-        validation_block = self._pre_compose_validation(edit_decisions, resolved_cuts, scene_plan)
+        validation_block = self._pre_compose_validation(
+            edit_decisions,
+            resolved_cuts,
+            scene_plan,
+            proposal_packet=inputs.get("proposal_packet"),
+            asset_manifest=asset_manifest,
+            script=inputs.get("script"),
+        )
         if validation_block is not None:
             return validation_block
 
