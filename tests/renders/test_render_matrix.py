@@ -84,7 +84,15 @@ def _write_testsrc(path: Path, width: int, height: int, duration: float) -> Path
 
 
 def _build_inputs(cell: RenderCell, sources: list[Path], output: Path) -> dict:
-    """Build the video_compose inputs for a cell."""
+    """Build the video_compose inputs for a cell.
+
+    `operation="render"` is the high-level orchestrator: takes
+    edit_decisions + asset_manifest, resolves asset IDs internally.
+    `operation="compose"` does the same for the FFmpeg path.
+    `operation="remotion_render"` is the LOW-LEVEL direct entry: it
+    expects cuts with pre-resolved file paths and ignores
+    asset_manifest. Build inputs accordingly so each cell exercises
+    the path it claims to."""
     asset_manifest = {
         "version": "1.0",
         "assets": [
@@ -95,6 +103,29 @@ def _build_inputs(cell: RenderCell, sources: list[Path], output: Path) -> dict:
             for i, p in enumerate(sources)
         ],
     }
+
+    if cell.operation == "remotion_render":
+        # Direct entry — pass literal paths, no asset_manifest needed.
+        cuts = [
+            {
+                "id": f"c{i}", "source": str(sources[i]),
+                "in_seconds": 0, "out_seconds": dur,
+            }
+            for i, dur in enumerate(cell.cuts_seconds)
+        ]
+        edit_decisions = {
+            "version": "1.0",
+            "render_runtime": cell.render_runtime,
+            "renderer_family": cell.renderer_family,
+            "cuts": cuts,
+        }
+        return {
+            "operation": cell.operation,
+            "edit_decisions": edit_decisions,
+            "output_path": str(output),
+        }
+
+    # render / compose path — IDs in cuts, resolved via asset_manifest.
     cuts = [
         {
             "id": f"c{i}", "source": f"a{i}",
