@@ -1,4 +1,4 @@
-.PHONY: setup install install-dev install-gpu test test-contracts test-renders-fast test-renders-full lint clean preflight demo demo-list hyperframes-doctor hyperframes-warm
+.PHONY: setup install install-dev install-gpu test test-contracts test-renders-fast test-renders-full test-audio-fast test-audio-full lint clean preflight demo demo-list hyperframes-doctor hyperframes-warm
 
 # ---- One-command setup ----
 
@@ -52,9 +52,18 @@ test-renders-fast:
 	python -m pytest tests/renders/ -m render_matrix_fast -v
 
 test-renders-full:
-	@echo "==> Render-matrix full (12 cells, includes Remotion, ~10 min)"
+	@echo "==> Render-matrix full (12 cells, includes Remotion, ~32s)"
 	@echo "    Run nightly. Remotion cells skip when npx isn't available."
 	python -m pytest tests/renders/ -m render_matrix_full -v
+
+test-audio-fast:
+	@echo "==> Audio-mixer matrix smoke (6 cells, all branches, ~5s)"
+	@echo "    Catches audio regressions without API calls."
+	python -m pytest tests/renders/ -m audio_matrix_fast -v
+
+test-audio-full:
+	@echo "==> Audio-mixer matrix full (10 cells with edge cases, ~10s)"
+	python -m pytest tests/renders/ -m audio_matrix_full -v
 
 # ---- Utilities ----
 

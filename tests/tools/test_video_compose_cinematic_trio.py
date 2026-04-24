@@ -157,10 +157,11 @@ def test_cinematic_scenes_have_required_shape(
     for field in ("id", "kind", "src", "startSeconds", "durationSeconds"):
         assert field in scene, f"Scene missing required field {field}: {scene}"
     assert scene["kind"] == "video"
-    # src is rewritten to file:// URI for Remotion's <OffthreadVideo>.
-    assert scene["src"].startswith("file://"), (
-        f"Scene src must be file:// URI for Remotion; got {scene['src']}"
-    )
+    # After d820d3b (Remotion --public-dir change), src is the bare
+    # filename — Remotion's bundle server serves it via /public/.
+    # Pre-d820d3b this was a file:// URI; the new shape is more robust
+    # because Chromium refuses local file:// URLs.
+    assert scene["src"], f"Scene src must be set; got {scene['src']!r}"
 
 
 def test_cinematic_in_seconds_becomes_trim_before(
@@ -252,5 +253,7 @@ def test_explainer_renderer_does_not_get_scenes_adapter(
         f"Explainer reads cuts[] natively — adapter must not run. "
         f"Got props keys: {list(props.keys())}"
     )
-    # cuts[] still gets file:// URI rewriting though.
-    assert props["cuts"][0]["source"].startswith("file://")
+    # After d820d3b, cuts[].source is the bare filename (Remotion serves
+    # it via --public-dir), not a file:// URI. The cuts shape is
+    # preserved — just the path-rewriting strategy changed.
+    assert props["cuts"][0]["source"], "cuts[].source must remain populated"

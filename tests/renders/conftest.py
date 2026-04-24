@@ -27,6 +27,14 @@ def pytest_configure(config: pytest.Config) -> None:
         "markers",
         "render_matrix_full: full render-matrix tests (requires Remotion + Node, ~10 min)",
     )
+    config.addinivalue_line(
+        "markers",
+        "audio_matrix_fast: smoke audio_mixer matrix (~5s, runs per PR)",
+    )
+    config.addinivalue_line(
+        "markers",
+        "audio_matrix_full: full audio_mixer matrix (~10s, edge cases)",
+    )
 
 
 def pytest_collection_modifyitems(
