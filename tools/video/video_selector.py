@@ -164,16 +164,41 @@ class VideoSelector(BaseTool):
             if "query" in required and "query" not in adapted:
                 adapted["query"] = adapted.get("prompt", "")
 
-        # Auto-resolve reference_image_path to a URL for providers that need it
-        if adapted.get("operation") == "image_to_video" and adapted.get("reference_image_path"):
+        # Adapt reference_image_{path,url} to whatever shape the selected
+        # provider actually accepts. Order of preference per branch:
+        #   path branch: reference_image_path (native) | image_path | image_url (FAL upload)
+        #   url branch:  reference_image_url (native) | image_url (rename) | image_path (skip)
+        # Provider-native path keys (image_path) are preferred over FAL upload so
+        # callers using providers that read local bytes themselves (apiyi_veo,
+        # seedance, veo, grok) don't need FAL_KEY just to satisfy the selector.
+        if adapted.get("operation") == "image_to_video":
             tool_props = getattr(tool, "input_schema", {}).get("properties", {})
-            # If the provider uses image_url (not reference_image_path), upload and convert
-            if "image_url" in tool_props and "image_url" not in adapted:
-                try:
-                    from tools.video._shared import upload_image_fal
-                    adapted["image_url"] = upload_image_fal(adapted["reference_image_path"])
-                except Exception as e:
-                    return ToolResult(success=False, error=f"Failed to upload reference image: {e}")
+
+            local_path = adapted.get("reference_image_path")
+            if local_path:
+                if "reference_image_path" in tool_props:
+                    pass  # native — leave as-is
+                elif "image_path" in tool_props:
+                    # Provider reads bytes itself. Rename if not already set;
+                    # otherwise the caller already satisfied the path
+                    # requirement and we do NOT fall through to a FAL upload.
+                    if "image_path" not in adapted:
+                        adapted["image_path"] = local_path
+                elif "image_url" in tool_props and "image_url" not in adapted:
+                    try:
+                        from tools.video._shared import upload_image_fal
+                        adapted["image_url"] = upload_image_fal(local_path)
+                    except Exception as e:
+                        return ToolResult(success=False, error=f"Failed to upload reference image: {e}")
+
+            ref_url = adapted.get("reference_image_url")
+            if ref_url:
+                if "reference_image_url" in tool_props:
+                    pass  # native
+                elif "image_url" in tool_props and "image_url" not in adapted:
+                    adapted["image_url"] = ref_url
+                # provider only takes image_path: URL→path download is out of
+                # scope for a routing layer; let the provider surface its own error.
 
         result = tool.execute(adapted)
         if result.success:
