@@ -34,13 +34,12 @@ RETRY_DELAY_S = 5
 RETRYABLE_PATTERNS = ["服务内部异常", "task_failed", "AUDIO_FILTERED"]
 
 # APIYI encodes aspect ratio, speed, HD/4K, and frame-lock into the model name:
-#   veo-3.1[-landscape][-fast|-relaxed][-fl][-hd|-4k]
+#   veo-3.1[-landscape][-fast][-fl][-hd|-4k]
 #
 # Suffix semantics:
 #   (none)      — portrait 720x1280 (default)
 #   landscape   — landscape 1280x720
 #   fast        — faster/cheaper
-#   relaxed     — relaxed speed (HD/4K only)
 #   fl          — first/last-frame mode (image-to-video)
 #   hd          — HD (landscape only)
 #   4k          — 4K resolution
@@ -58,32 +57,28 @@ MODELS = [
     # Landscape HD
     "veo-3.1-landscape-hd",
     "veo-3.1-landscape-fast-hd",
-    "veo-3.1-landscape-relaxed-hd",
     "veo-3.1-landscape-fl-hd",
     "veo-3.1-landscape-fast-fl-hd",
-    "veo-3.1-landscape-relaxed-fl-hd",
     # 4K
     "veo-3.1-4k",
     "veo-3.1-fl-4k",
     "veo-3.1-fast-4k",
     "veo-3.1-fast-fl-4k",
-    "veo-3.1-relaxed-4k",
     "veo-3.1-landscape-4k",
     "veo-3.1-landscape-fl-4k",
     "veo-3.1-landscape-fast-4k",
     "veo-3.1-landscape-fast-fl-4k",
-    "veo-3.1-landscape-relaxed-4k",
 ]
 
 
 def _model_pricing(model: str) -> float:
     """Estimate per-video cost from APIYI model name."""
-    is_fast_or_relaxed = "fast" in model or "relaxed" in model
+    is_fast = "fast" in model
     if "-4k" in model:
-        return 0.45 if is_fast_or_relaxed else 0.55
+        return 0.40 if is_fast else 0.60
     if "-hd" in model:
-        return 0.25 if is_fast_or_relaxed else 0.35
-    return 0.15 if "fast" in model else 0.25
+        return 0.25 if is_fast else 0.35
+    return 0.15 if is_fast else 0.25
 
 
 def _model_aspect_ratio(model: str) -> str:
@@ -202,7 +197,7 @@ class ApiyiVeoVideo(BaseTool):
                 "description": (
                     "Explicit APIYI model name. If omitted, derived from aspect_ratio, "
                     "resolution, fast, and operation. "
-                    "Pattern: veo-3.1[-landscape][-fast|-relaxed][-fl][-hd|-4k]"
+                    "Pattern: veo-3.1[-landscape][-fast][-fl][-hd|-4k]"
                 ),
             },
             "aspect_ratio": {
