@@ -1,8 +1,7 @@
-"""Veo 3.1 video generation via APIYI gateway (Official API Version).
+"""Veo 3.1 video generation via APIYI gateway (Legacy Version).
 
 APIYI provides access to Google Veo 3.1 models for text-to-video and
 image-to-video generation through a simple REST API with async polling.
-This version implements the official API specification.
 """
 
 from __future__ import annotations
@@ -34,23 +33,109 @@ RETRY_DELAY_S = 5
 
 RETRYABLE_PATTERNS = ["服务内部异常", "task_failed", "AUDIO_FILTERED"]
 
-# The new official APIYi Veo 3.1 has only two models
+# APIYI encodes aspect ratio, speed, HD/4K, and frame-lock into the model name:
+#   veo-3.1[-landscape][-fast][-fl][-hd|-4k]
+#
+# Suffix semantics:
+#   (none)      — portrait 720x1280 (default)
+#   landscape   — landscape 1280x720
+#   fast        — faster/cheaper
+#   fl          — first/last-frame mode (image-to-video)
+#   hd          — HD (landscape only)
+#   4k          — 4K resolution
 MODELS = [
-    "veo-3.1-fast-generate-preview",
-    "veo-3.1-generate-preview",
+    # Portrait (720x1280) — standard
+    "veo-3.1",
+    "veo-3.1-fl",
+    "veo-3.1-fast",
+    "veo-3.1-fast-fl",
+    # Landscape (1280x720) — standard
+    "veo-3.1-landscape",
+    "veo-3.1-landscape-fl",
+    "veo-3.1-landscape-fast",
+    "veo-3.1-landscape-fast-fl",
+    # Landscape HD
+    "veo-3.1-landscape-hd",
+    "veo-3.1-landscape-fast-hd",
+    "veo-3.1-landscape-fl-hd",
+    "veo-3.1-landscape-fast-fl-hd",
+    # 4K
+    "veo-3.1-4k",
+    "veo-3.1-fl-4k",
+    "veo-3.1-fast-4k",
+    "veo-3.1-fast-fl-4k",
+    "veo-3.1-landscape-4k",
+    "veo-3.1-landscape-fl-4k",
+    "veo-3.1-landscape-fast-4k",
+    "veo-3.1-landscape-fast-fl-4k",
 ]
 
 
 def _model_pricing(model: str) -> float:
-    """Official Veo 3.1 pricing: $0.30 for fast, $1.20 for standard."""
-    if model == "veo-3.1-fast-generate-preview":
-        return 0.30
-    return 1.20
+    """Estimate per-video cost from APIYI model name."""
+    is_fast = "fast" in model
+    if "-4k" in model:
+        return 0.40 if is_fast else 0.60
+    if "-hd" in model:
+        return 0.25 if is_fast else 0.35
+    return 0.15 if is_fast else 0.25
 
 
-class ApiyiVeoVideo(BaseTool):
-    name = "apiyi_veo_video"
-    version = "0.2.0"
+def _model_aspect_ratio(model: str) -> str:
+    return "16:9" if "landscape" in model else "9:16"
+
+
+def _model_resolution(model: str) -> str:
+    if "-4k" in model:
+        return "4k"
+    if "-hd" in model:
+        return "1080p"
+    return "720p"
+
+
+def _derive_model(
+    explicit_model: str | None,
+    aspect_ratio: str | None,
+    resolution: str | None,
+    fast: bool,
+    has_image: bool,
+) -> str:
+    """Pick a model name from canonical selector params when no explicit model is given."""
+    if explicit_model:
+        return explicit_model
+
+    # JSON Schema defaults are not applied to inputs at runtime, so when the
+    # caller (e.g. video_selector forwarding without aspect_ratio) omits the
+    # key we have to coalesce it here. Matches the schema default and keeps
+    # the -landscape suffix flowing through to the APIYI model name.
+    if aspect_ratio is None:
+        aspect_ratio = "16:9"
+
+    parts = ["veo-3.1"]
+
+    landscape = aspect_ratio in ("16:9", "landscape", "horizontal")
+    if landscape:
+        parts.append("landscape")
+
+    if fast:
+        parts.append("fast")
+
+    if has_image:
+        parts.append("fl")
+
+    res = (resolution or "").lower()
+    if res == "4k":
+        parts.append("4k")
+    elif res in ("hd", "1080p") and landscape:
+        # HD is landscape-only per APIYI
+        parts.append("hd")
+
+    return "-".join(parts)
+
+
+class ApiyiVeoVideoLegacy(object):
+    name = "apiyi_veo_video_legacy"
+    version = "0.1.0"
     tier = ToolTier.GENERATE
     capability = "video_generation"
     provider = "apiyi"
@@ -66,12 +151,12 @@ class ApiyiVeoVideo(BaseTool):
     )
     agent_skills = ["ai-video-gen"]
 
-    capabilities = ["text_to_video", "image_to_video"]
+    capabilities = ["text_to_video", "image_to_video", "first_last_frame_to_video"]
     supports = {
         "text_to_video": True,
         "image_to_video": True,
         "reference_to_video": False,
-        "first_last_frame_to_video": False,
+        "first_last_frame_to_video": True,
         "native_audio": False,
         "portrait": True,
         "landscape": True,
@@ -79,9 +164,10 @@ class ApiyiVeoVideo(BaseTool):
         "4k": True,
     }
     best_for = [
-        "Veo 3.1 video generation via official APIYI endpoints",
-        "portrait and landscape with 720p / 1080p / 4K resolutions",
-        "high-quality image-to-video and text-to-video",
+        "Veo 3.1 video generation via APIYI gateway",
+        "portrait and landscape with 720p / HD / 4K variants",
+        "first/last-frame locked image-to-video",
+        "alternative Veo access when fal.ai is unavailable",
     ]
     not_good_for = [
         "offline generation",
@@ -97,30 +183,46 @@ class ApiyiVeoVideo(BaseTool):
             "prompt": {"type": "string", "description": "Video generation prompt"},
             "operation": {
                 "type": "string",
-                "enum": ["text_to_video", "image_to_video"],
+                "enum": ["text_to_video", "image_to_video", "first_last_frame_to_video"],
                 "default": "text_to_video",
-                "description": "Generation mode. image_to_video requires image_url/image_path.",
+                "description": (
+                    "Generation mode. image_to_video requires image_url/image_path. "
+                    "first_last_frame_to_video requires first_frame_* and last_frame_*. "
+                    "Both image modes force a -fl model variant."
+                ),
             },
             "model": {
                 "type": "string",
                 "enum": MODELS,
-                "default": "veo-3.1-fast-generate-preview",
-                "description": "APIYI model name. veo-3.1-fast-generate-preview ($0.30) or veo-3.1-generate-preview ($1.20).",
+                "description": (
+                    "Explicit APIYI model name. If omitted, derived from aspect_ratio, "
+                    "resolution, fast, and operation. "
+                    "Pattern: veo-3.1[-landscape][-fast][-fl][-hd|-4k]"
+                ),
             },
             "aspect_ratio": {
                 "type": "string",
                 "enum": ["16:9", "9:16"],
                 "default": "16:9",
-                "description": "Aspect ratio of the generated video.",
+                "description": "Used to derive model when 'model' not provided. 16:9 → landscape, 9:16 → portrait. Default matches every other video generator and the video_compose canvas default (1920x1080); overriding to 9:16 is a deliberate vertical-feed choice.",
             },
             "resolution": {
                 "type": "string",
-                "enum": ["720p", "1080p", "4k"],
+                "enum": ["720p", "1080p", "hd", "4k"],
                 "default": "720p",
-                "description": "Target resolution.",
+                "description": "Used to derive model. HD requires landscape. 4K available both orientations.",
+            },
+            "fast": {
+                "type": "boolean",
+                "default": True,
+                "description": "Used to derive model. true → cheaper '-fast' variant (~40% cost reduction).",
             },
             "image_url": {"type": "string", "description": "Reference image URL for image_to_video"},
             "image_path": {"type": "string", "description": "Local reference image path for image_to_video"},
+            "first_frame_url": {"type": "string", "description": "First-frame URL for first_last_frame_to_video"},
+            "first_frame_path": {"type": "string", "description": "First-frame local path for first_last_frame_to_video"},
+            "last_frame_url": {"type": "string", "description": "Last-frame URL for first_last_frame_to_video"},
+            "last_frame_path": {"type": "string", "description": "Last-frame local path for first_last_frame_to_video"},
             "output_path": {"type": "string"},
         },
     }
@@ -145,10 +247,21 @@ class ApiyiVeoVideo(BaseTool):
         return ToolStatus.UNAVAILABLE
 
     def estimate_cost(self, inputs: dict[str, Any]) -> float:
-        model = inputs.get("model", "veo-3.1-fast-generate-preview")
-        if model not in MODELS:
-            model = "veo-3.1-fast-generate-preview"
+        operation = inputs.get("operation", "text_to_video")
+        model = self._resolve_model(inputs, operation)
         return _model_pricing(model)
+
+    @staticmethod
+    def _resolve_model(inputs: dict[str, Any], operation: str) -> str:
+        """Pick the model name from explicit or derived inputs."""
+        needs_fl = operation in ("image_to_video", "first_last_frame_to_video")
+        return _derive_model(
+            explicit_model=inputs.get("model"),
+            aspect_ratio=inputs.get("aspect_ratio"),
+            resolution=inputs.get("resolution"),
+            fast=bool(inputs.get("fast", True)),
+            has_image=needs_fl,
+        )
 
     @staticmethod
     def _resolve_frame(path_value: str | None, url_value: str | None) -> bytes | None:
@@ -167,6 +280,36 @@ class ApiyiVeoVideo(BaseTool):
             return resp.content
 
         return None
+
+    @classmethod
+    def _resolve_frames(cls, inputs: dict[str, Any], operation: str) -> list[bytes]:
+        """Resolve input frames based on operation.
+
+        image_to_video                 → one frame from image_url/image_path
+        first_last_frame_to_video      → two frames from first_frame_* + last_frame_*
+                                         (image_url/image_path also accepted as first-frame alias)
+        text_to_video                  → no frames
+        """
+        if operation == "text_to_video":
+            return []
+
+        first = cls._resolve_frame(
+            inputs.get("first_frame_path") or inputs.get("image_path"),
+            inputs.get("first_frame_url") or inputs.get("image_url"),
+        )
+        if first is None:
+            raise ValueError(
+                f"{operation} requires image_url/image_path (or first_frame_url/first_frame_path)"
+            )
+
+        if operation == "image_to_video":
+            return [first]
+
+        # first_last_frame_to_video
+        last = cls._resolve_frame(inputs.get("last_frame_path"), inputs.get("last_frame_url"))
+        if last is None:
+            raise ValueError("first_last_frame_to_video requires last_frame_url or last_frame_path")
+        return [first, last]
 
     def execute(self, inputs: dict[str, Any]) -> ToolResult:
         # output_path is required.
@@ -199,70 +342,46 @@ class ApiyiVeoVideo(BaseTool):
         base_url = self._get_base_url()
         prompt = inputs["prompt"]
         operation = inputs.get("operation", "text_to_video")
-        if operation == "first_last_frame_to_video":
-            operation = "image_to_video"
         auth_header = {"Authorization": api_key}
 
+        # Resolve frames based on operation
+        try:
+            frames = self._resolve_frames(inputs, operation)
+        except (FileNotFoundError, ValueError) as e:
+            return ToolResult(success=False, error=str(e))
+        except Exception as e:
+            return ToolResult(success=False, error=f"Failed to resolve image input: {e}")
+
         # Resolve model
-        model = inputs.get("model", "veo-3.1-fast-generate-preview")
+        model = self._resolve_model(inputs, operation)
         if model not in MODELS:
-            if "fast" in model:
-                model = "veo-3.1-fast-generate-preview"
-            else:
-                model = "veo-3.1-generate-preview"
-
-        # Normalize Aspect Ratio
-        aspect_ratio_input = inputs.get("aspect_ratio", "16:9")
-        aspectRatio = "16:9" if aspect_ratio_input in ("16:9", "landscape", "horizontal") else "9:16"
-
-        # Normalize Resolution & Size
-        resolution_input = inputs.get("resolution", "720p")
-        if resolution_input == "4k":
-            size = "3840x2160" if aspectRatio == "16:9" else "2160x3840"
-            resolution = "4k"
-        elif resolution_input in ("hd", "1080p"):
-            size = "1920x1080" if aspectRatio == "16:9" else "1080x1920"
-            resolution = "1080p"
-        else:
-            size = "1280x720" if aspectRatio == "16:9" else "720x1280"
-            resolution = "720p"
-
-        # Resolve image frame for image_to_video
-        frame_bytes: bytes | None = None
-        if operation == "image_to_video":
-            try:
-                frame_path = inputs.get("image_path") or inputs.get("first_frame_path")
-                frame_url = inputs.get("image_url") or inputs.get("first_frame_url")
-                frame_bytes = self._resolve_frame(frame_path, frame_url)
-            except Exception as e:
-                return ToolResult(success=False, error=f"Failed to resolve image input: {e}")
-
-            if frame_bytes is None:
-                return ToolResult(
-                    success=False,
-                    error="image_to_video requires image_url/image_path or first_frame_url/first_frame_path",
-                )
+            return ToolResult(
+                success=False,
+                error=f"Unknown APIYI model '{model}'. Valid models: {MODELS}",
+            )
+        if frames and "-fl" not in model:
+            return ToolResult(
+                success=False,
+                error=(
+                    f"{operation} requires a frame-locked (-fl) model but '{model}' is not -fl. "
+                    f"Omit 'model' to auto-derive, or pick a -fl variant."
+                ),
+            )
 
         last_error: str | None = None
 
         try:
             for attempt in range(1, MAX_RETRIES + 1):
                 # Step 1 — Submit video generation
-                if operation == "image_to_video" and frame_bytes is not None:
+                if frames:
                     from io import BytesIO
 
-                    # Multipart form-data payload with exactly one file field
-                    files = {
-                        "input_reference": ("image.jpg", BytesIO(frame_bytes), "image/jpeg")
-                    }
-                    data = {
-                        "model": model,
-                        "prompt": prompt,
-                        "duration": "8",  # strictly string "8"
-                        "resolution": resolution,
-                        "aspectRatio": aspectRatio,
-                        "size": size,
-                    }
+                    # Multipart form with one input_reference per frame
+                    files = [
+                        ("input_reference", (f"frame_{i}.jpg", BytesIO(buf), "image/jpeg"))
+                        for i, buf in enumerate(frames)
+                    ]
+                    data = {"prompt": prompt, "model": model}
                     submit_resp = requests.post(
                         f"{base_url}/v1/videos",
                         headers=auth_header,
@@ -271,21 +390,10 @@ class ApiyiVeoVideo(BaseTool):
                         timeout=30,
                     )
                 else:
-                    # Text-to-Video JSON payload
-                    payload = {
-                        "model": model,
-                        "prompt": prompt,
-                        "duration": "8",  # strictly string "8"
-                        "size": size,
-                        "metadata": {
-                            "resolution": resolution,
-                            "aspectRatio": aspectRatio,
-                        },
-                    }
                     submit_resp = requests.post(
                         f"{base_url}/v1/videos",
                         headers={**auth_header, "Content-Type": "application/json"},
-                        json=payload,
+                        json={"prompt": prompt, "model": model},
                         timeout=30,
                     )
 
@@ -359,14 +467,14 @@ class ApiyiVeoVideo(BaseTool):
                         error="APIYI Veo generation timed out after 10 minutes",
                     )
 
-                # Step 3 — Download video bytes. Add mitigation for the completed-but-in-progress download race.
+                # Step 3 — Download video bytes.
                 content_resp = requests.get(
                     f"{base_url}/v1/videos/{video_id}/content",
                     headers=headers,
                     timeout=120,
                 )
                 _IN_PROGRESS_TEXT = "task status is IN_PROGRESS"
-                for delay in (4, 8, 16, 24, 32):
+                for delay in (10, 15, 25, 35, 45):
                     if content_resp.status_code != 400:
                         break
                     if _IN_PROGRESS_TEXT not in (content_resp.text or ""):
@@ -403,9 +511,9 @@ class ApiyiVeoVideo(BaseTool):
                         "prompt": prompt,
                         "operation": operation,
                         "output": str(output_path),
-                        "aspect_ratio": aspectRatio,
-                        "resolution": resolution,
-                        "frame_count": 1 if operation == "image_to_video" else 0,
+                        "aspect_ratio": _model_aspect_ratio(model),
+                        "resolution": _model_resolution(model),
+                        "frame_count": len(frames),
                         "attempts": attempt,
                     },
                     artifacts=[str(output_path)],
@@ -434,14 +542,7 @@ class ApiyiVeoVideo(BaseTool):
 
         start = time.time()
         operation = inputs.get("operation", "text_to_video")
-        if operation == "first_last_frame_to_video":
-            operation = "image_to_video"
-        model = inputs.get("model", "veo-3.1-fast-generate-preview")
-        if model not in MODELS:
-            if "fast" in model:
-                model = "veo-3.1-fast-generate-preview"
-            else:
-                model = "veo-3.1-generate-preview"
+        model = self._resolve_model(inputs, operation)
 
         ffmpeg = shutil.which("ffmpeg")
         if ffmpeg is None:
@@ -453,21 +554,9 @@ class ApiyiVeoVideo(BaseTool):
         output_path = Path(output_path_raw)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        aspect_ratio_input = inputs.get("aspect_ratio", "16:9")
-        aspectRatio = "16:9" if aspect_ratio_input in ("16:9", "landscape", "horizontal") else "9:16"
+        aspect = _model_aspect_ratio(model)
+        width, height = (1280, 720) if aspect == "16:9" else (720, 1280)
 
-        resolution_input = inputs.get("resolution", "720p")
-        if resolution_input == "4k":
-            width, height = (3840, 2160) if aspectRatio == "16:9" else (2160, 3840)
-            resolution = "4k"
-        elif resolution_input in ("hd", "1080p"):
-            width, height = (1920, 1080) if aspectRatio == "16:9" else (1080, 1920)
-            resolution = "1080p"
-        else:
-            width, height = (1280, 720) if aspectRatio == "16:9" else (720, 1280)
-            resolution = "720p"
-
-        # generate an 8-second video
         cmd = [
             ffmpeg,
             "-y",
@@ -505,9 +594,9 @@ class ApiyiVeoVideo(BaseTool):
                 "prompt": inputs["prompt"],
                 "operation": operation,
                 "output": str(output_path),
-                "aspect_ratio": aspectRatio,
-                "resolution": resolution,
-                "frame_count": 1 if operation == "image_to_video" else 0,
+                "aspect_ratio": aspect,
+                "resolution": _model_resolution(model),
+                "frame_count": 1,
                 "attempts": 1,
                 "mock": True,
             },
