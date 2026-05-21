@@ -119,6 +119,12 @@ class ApiyiVeoVideo(BaseTool):
                 "default": "720p",
                 "description": "Target resolution.",
             },
+            "duration": {
+                "type": "string",
+                "enum": ["8"],
+                "default": "8",
+                "description": "Duration in seconds (only '8' is supported)",
+            },
             "image_url": {"type": "string", "description": "Reference image URL for image_to_video"},
             "image_path": {"type": "string", "description": "Local reference image path for image_to_video"},
             "output_path": {"type": "string"},

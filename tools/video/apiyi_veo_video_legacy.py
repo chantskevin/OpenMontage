@@ -212,6 +212,12 @@ class ApiyiVeoVideoLegacy(object):
                 "default": "720p",
                 "description": "Used to derive model. HD requires landscape. 4K available both orientations.",
             },
+            "duration": {
+                "type": "string",
+                "enum": ["8"],
+                "default": "8",
+                "description": "Duration in seconds (only '8' is supported)",
+            },
             "fast": {
                 "type": "boolean",
                 "default": True,
@@ -381,7 +387,7 @@ class ApiyiVeoVideoLegacy(object):
                         ("input_reference", (f"frame_{i}.jpg", BytesIO(buf), "image/jpeg"))
                         for i, buf in enumerate(frames)
                     ]
-                    data = {"prompt": prompt, "model": model}
+                    data = {"prompt": prompt, "model": model, "duration": "8"}
                     submit_resp = requests.post(
                         f"{base_url}/v1/videos",
                         headers=auth_header,
@@ -393,7 +399,7 @@ class ApiyiVeoVideoLegacy(object):
                     submit_resp = requests.post(
                         f"{base_url}/v1/videos",
                         headers={**auth_header, "Content-Type": "application/json"},
-                        json={"prompt": prompt, "model": model},
+                        json={"prompt": prompt, "model": model, "duration": "8"},
                         timeout=30,
                     )
 

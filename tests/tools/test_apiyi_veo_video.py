@@ -121,3 +121,13 @@ def test_mock_mode_respects_explicit_portrait_aspect(
         text=True,
     )
     assert probe.stdout.strip() == "720,1280"
+
+
+def test_duration_in_schema() -> None:
+    tool = ApiyiVeoVideo()
+    properties = tool.input_schema["properties"]
+    assert "duration" in properties
+    duration_prop = properties["duration"]
+    assert duration_prop["default"] == "8"
+    assert duration_prop["enum"] == ["8"]
+
